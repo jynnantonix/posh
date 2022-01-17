@@ -13,10 +13,16 @@ use std::cell::UnsafeCell;
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Barrier,
+        Arc,
     },
     thread,
     time::Duration,
+};
+
+use futures::{
+    channel::mpsc::channel,
+    executor::{block_on, ThreadPool},
+    SinkExt, StreamExt,
 };
 
 trait Mutex<T> {
@@ -71,15 +77,14 @@ unsafe impl<T: Send> Send for SrwLock<T> {}
 #[cfg(windows)]
 impl<T> Mutex<T> for SrwLock<T> {
     fn new(v: T) -> Self {
-        let mut h: synchapi::SRWLOCK = synchapi::SRWLOCK { Ptr: std::ptr::null_mut() };
+        let mut h: synchapi::SRWLOCK = synchapi::SRWLOCK {
+            Ptr: std::ptr::null_mut(),
+        };
 
         unsafe {
             synchapi::InitializeSRWLock(&mut h);
         }
-        SrwLock(
-            UnsafeCell::new(v),
-            UnsafeCell::new(h),
-        )
+        SrwLock(UnsafeCell::new(v), UnsafeCell::new(h))
     }
     fn lock<F, R>(&self, f: F) -> R
     where
@@ -136,25 +141,109 @@ impl<T> Drop for PthreadMutex<T> {
     }
 }
 
-fn run_benchmark<M: Mutex<f64> + Send + Sync + 'static>(
-    num_threads: usize,
+fn run_nsync_benchmark(
+    num_tasks: usize,
     work_per_critical_section: usize,
     work_between_critical_sections: usize,
     seconds_per_test: usize,
+    ex: ThreadPool,
 ) -> Vec<usize> {
-    let lock = Arc::new(([0u8; 300], M::new(0.0), [0u8; 300]));
+    let lock = Arc::new(([0u8; 300], nsync::Mutex::new(0.0), [0u8; 300]));
     let keep_going = Arc::new(AtomicBool::new(true));
-    let barrier = Arc::new(Barrier::new(num_threads));
-    let mut threads = vec![];
-    for _ in 0..num_threads {
-        let barrier = barrier.clone();
+    let (tx, rx) = channel(num_tasks);
+    for _ in 0..num_tasks {
         let lock = lock.clone();
         let keep_going = keep_going.clone();
-        threads.push(thread::spawn(move || {
+        let mut tx = tx.clone();
+        ex.spawn_ok(async move {
             let mut local_value = 0.0;
             let mut value = 0.0;
             let mut iterations = 0usize;
-            barrier.wait();
+            while keep_going.load(Ordering::Relaxed) {
+                {
+                    let mut shared_value = lock.1.lock().await;
+                    for _ in 0..work_per_critical_section {
+                        *shared_value += value;
+                        *shared_value *= 1.01;
+                        value = *shared_value;
+                    }
+                    drop(shared_value);
+                }
+                for _ in 0..work_between_critical_sections {
+                    local_value += value;
+                    local_value *= 1.01;
+                    value = local_value;
+                }
+                iterations += 1;
+            }
+            tx.send((iterations, value)).await.unwrap();
+        });
+    }
+
+    thread::sleep(Duration::from_secs(seconds_per_test as u64));
+    keep_going.store(false, Ordering::Relaxed);
+
+    drop(tx);
+    block_on(rx.map(|x| x.0).collect())
+}
+
+fn run_nsync_benchmark_iterations(
+    num_tasks: usize,
+    work_per_critical_section: usize,
+    work_between_critical_sections: usize,
+    seconds_per_test: usize,
+    test_iterations: usize,
+) {
+    let ex = ThreadPool::new().unwrap();
+    let mut data = vec![];
+    for _ in 0..test_iterations {
+        let run_data = run_nsync_benchmark(
+            num_tasks,
+            work_per_critical_section,
+            work_between_critical_sections,
+            seconds_per_test,
+            ex.clone(),
+        );
+        data.extend_from_slice(&run_data);
+    }
+
+    let total = data.iter().fold(0f64, |a, b| a + *b as f64);
+    let average = total / data.len() as f64;
+    let variance = data
+        .iter()
+        .fold(0f64, |a, b| a + ((*b as f64 - average).powi(2)))
+        / data.len() as f64;
+    data.sort();
+
+    let k_hz = 1.0 / seconds_per_test as f64 / 1000.0;
+    println!(
+        "{:20} | {:10.3} kHz | {:10.3} kHz | {:10.3} kHz | {:10.3} kHz",
+        "nsync::Mutex",
+        total * k_hz,
+        average * k_hz,
+        data[data.len() / 2] as f64 * k_hz,
+        variance.sqrt() * k_hz
+    );
+}
+
+fn run_benchmark<M: Mutex<f64> + Send + Sync + 'static>(
+    num_tasks: usize,
+    work_per_critical_section: usize,
+    work_between_critical_sections: usize,
+    seconds_per_test: usize,
+    ex: ThreadPool,
+) -> Vec<usize> {
+    let lock = Arc::new(([0u8; 300], M::new(0.0), [0u8; 300]));
+    let keep_going = Arc::new(AtomicBool::new(true));
+    let (tx, rx) = channel(num_tasks);
+    for _ in 0..num_tasks {
+        let lock = lock.clone();
+        let keep_going = keep_going.clone();
+        let mut tx = tx.clone();
+        ex.spawn_ok(async move {
+            let mut local_value = 0.0;
+            let mut value = 0.0;
+            let mut iterations = 0usize;
             while keep_going.load(Ordering::Relaxed) {
                 lock.1.lock(|shared_value| {
                     for _ in 0..work_per_critical_section {
@@ -170,34 +259,39 @@ fn run_benchmark<M: Mutex<f64> + Send + Sync + 'static>(
                 }
                 iterations += 1;
             }
-            (iterations, value)
-        }));
+            tx.send((iterations, value)).await.unwrap();
+        });
     }
 
     thread::sleep(Duration::from_secs(seconds_per_test as u64));
     keep_going.store(false, Ordering::Relaxed);
-    threads.into_iter().map(|x| x.join().unwrap().0).collect()
+
+    drop(tx);
+    block_on(rx.map(|x| x.0).collect())
 }
 
 fn run_benchmark_iterations<M: Mutex<f64> + Send + Sync + 'static>(
-    num_threads: usize,
+    num_tasks: usize,
     work_per_critical_section: usize,
     work_between_critical_sections: usize,
     seconds_per_test: usize,
     test_iterations: usize,
 ) {
     let mut data = vec![];
+    let ex = ThreadPool::new().unwrap();
     for _ in 0..test_iterations {
         let run_data = run_benchmark::<M>(
-            num_threads,
+            num_tasks,
             work_per_critical_section,
             work_between_critical_sections,
             seconds_per_test,
+            ex.clone(),
         );
         data.extend_from_slice(&run_data);
     }
 
-    let average = data.iter().fold(0f64, |a, b| a + *b as f64) / data.len() as f64;
+    let total = data.iter().fold(0f64, |a, b| a + *b as f64);
+    let average = total / data.len() as f64;
     let variance = data
         .iter()
         .fold(0f64, |a, b| a + ((*b as f64 - average).powi(2)))
@@ -206,8 +300,9 @@ fn run_benchmark_iterations<M: Mutex<f64> + Send + Sync + 'static>(
 
     let k_hz = 1.0 / seconds_per_test as f64 / 1000.0;
     println!(
-        "{:20} | {:10.3} kHz | {:10.3} kHz | {:10.3} kHz",
+        "{:20} | {:10.3} kHz | {:10.3} kHz | {:10.3} kHz | {:10.3} kHz",
         M::name(),
+        total * k_hz,
         average * k_hz,
         data[data.len() / 2] as f64 * k_hz,
         variance.sqrt() * k_hz
@@ -217,17 +312,17 @@ fn run_benchmark_iterations<M: Mutex<f64> + Send + Sync + 'static>(
 fn run_all(
     args: &[ArgRange],
     first: &mut bool,
-    num_threads: usize,
+    num_tasks: usize,
     work_per_critical_section: usize,
     work_between_critical_sections: usize,
     seconds_per_test: usize,
     test_iterations: usize,
 ) {
-    if num_threads == 0 {
+    if num_tasks == 0 {
         return;
     }
     if *first || !args[0].is_single() {
-        println!("- Running with {} threads", num_threads);
+        println!("- Running with {} tasks", num_tasks);
     }
     if *first || !args[1].is_single() || !args[2].is_single() {
         println!(
@@ -241,12 +336,20 @@ fn run_all(
     *first = false;
 
     println!(
-        "{:^20} | {:^14} | {:^14} | {:^14}",
-        "name", "average", "median", "std.dev."
+        "{:^20} | {:^14} | {:^14} | {:^14} | {:^14}",
+        "name", "total", "average", "median", "std.dev."
+    );
+
+    run_nsync_benchmark_iterations(
+        num_tasks,
+        work_per_critical_section,
+        work_between_critical_sections,
+        seconds_per_test,
+        test_iterations,
     );
 
     run_benchmark_iterations::<parking_lot::Mutex<f64>>(
-        num_threads,
+        num_tasks,
         work_per_critical_section,
         work_between_critical_sections,
         seconds_per_test,
@@ -254,7 +357,7 @@ fn run_all(
     );
 
     run_benchmark_iterations::<std::sync::Mutex<f64>>(
-        num_threads,
+        num_tasks,
         work_per_critical_section,
         work_between_critical_sections,
         seconds_per_test,
@@ -262,7 +365,7 @@ fn run_all(
     );
     if cfg!(windows) {
         run_benchmark_iterations::<SrwLock<f64>>(
-            num_threads,
+            num_tasks,
             work_per_critical_section,
             work_between_critical_sections,
             seconds_per_test,
@@ -271,7 +374,7 @@ fn run_all(
     }
     if cfg!(unix) {
         run_benchmark_iterations::<PthreadMutex<f64>>(
-            num_threads,
+            num_tasks,
             work_per_critical_section,
             work_between_critical_sections,
             seconds_per_test,
@@ -282,14 +385,14 @@ fn run_all(
 
 fn main() {
     let args = args::parse(&[
-        "numThreads",
+        "numTasks",
         "workPerCriticalSection",
         "workBetweenCriticalSections",
         "secondsPerTest",
         "testIterations",
     ]);
     let mut first = true;
-    for num_threads in args[0] {
+    for num_tasks in args[0] {
         for work_per_critical_section in args[1] {
             for work_between_critical_sections in args[2] {
                 for seconds_per_test in args[3] {
@@ -297,7 +400,7 @@ fn main() {
                         run_all(
                             &args,
                             &mut first,
-                            num_threads,
+                            num_tasks,
                             work_per_critical_section,
                             work_between_critical_sections,
                             seconds_per_test,

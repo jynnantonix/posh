@@ -13,10 +13,17 @@ use std::cell::UnsafeCell;
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Barrier,
+        Arc,
     },
     thread,
     time::Duration,
+};
+
+use futures::{
+    channel::mpsc::channel,
+    executor::{block_on, ThreadPool},
+    future::join,
+    SinkExt, StreamExt,
 };
 
 trait RwLock<T> {
@@ -107,15 +114,14 @@ unsafe impl<T: Send> Send for SrwLock<T> {}
 #[cfg(windows)]
 impl<T> RwLock<T> for SrwLock<T> {
     fn new(v: T) -> Self {
-        let mut h: synchapi::SRWLOCK = synchapi::SRWLOCK { Ptr: std::ptr::null_mut() };
+        let mut h: synchapi::SRWLOCK = synchapi::SRWLOCK {
+            Ptr: std::ptr::null_mut(),
+        };
 
         unsafe {
             synchapi::InitializeSRWLock(&mut h);
         }
-        SrwLock(
-            UnsafeCell::new(v),
-            UnsafeCell::new(h),
-        )
+        SrwLock(UnsafeCell::new(v), UnsafeCell::new(h))
     }
     fn read<F, R>(&self, f: F) -> R
     where
@@ -194,27 +200,136 @@ impl<T> Drop for PthreadRwLock<T> {
     }
 }
 
-fn run_benchmark<M: RwLock<f64> + Send + Sync + 'static>(
-    num_writer_threads: usize,
-    num_reader_threads: usize,
+fn run_nsync_benchmark(
+    num_writer_tasks: usize,
+    num_reader_tasks: usize,
     work_per_critical_section: usize,
     work_between_critical_sections: usize,
     seconds_per_test: usize,
+    ex: ThreadPool,
 ) -> (Vec<usize>, Vec<usize>) {
-    let lock = Arc::new(([0u8; 300], M::new(0.0), [0u8; 300]));
+    let lock = Arc::new(([0u8; 300], nsync::Mutex::new(0.0), [0u8; 300]));
     let keep_going = Arc::new(AtomicBool::new(true));
-    let barrier = Arc::new(Barrier::new(num_reader_threads + num_writer_threads));
-    let mut writers = vec![];
-    let mut readers = vec![];
-    for _ in 0..num_writer_threads {
-        let barrier = barrier.clone();
+    let (wtx, wrx) = channel(num_writer_tasks);
+    for _ in 0..num_writer_tasks {
         let lock = lock.clone();
         let keep_going = keep_going.clone();
-        writers.push(thread::spawn(move || {
+        let mut tx = wtx.clone();
+        ex.spawn_ok(async move {
             let mut local_value = 0.0;
             let mut value = 0.0;
             let mut iterations = 0usize;
-            barrier.wait();
+            while keep_going.load(Ordering::Relaxed) {
+                {
+                    let mut shared_value = lock.1.lock().await;
+                    for _ in 0..work_per_critical_section {
+                        *shared_value += value;
+                        *shared_value *= 1.01;
+                        value = *shared_value;
+                    }
+                    drop(shared_value);
+                }
+                for _ in 0..work_between_critical_sections {
+                    local_value += value;
+                    local_value *= 1.01;
+                    value = local_value;
+                }
+                iterations += 1;
+            }
+            tx.send((iterations, value)).await.unwrap();
+        });
+    }
+    let (rtx, rrx) = channel(num_reader_tasks);
+    for _ in 0..num_reader_tasks {
+        let lock = lock.clone();
+        let keep_going = keep_going.clone();
+        let mut tx = rtx.clone();
+        ex.spawn_ok(async move {
+            let mut local_value = 0.0;
+            let mut value = 0.0;
+            let mut iterations = 0usize;
+            while keep_going.load(Ordering::Relaxed) {
+                {
+                    let shared_value = lock.1.read_lock().await;
+                    for _ in 0..work_per_critical_section {
+                        local_value += value;
+                        local_value *= *shared_value;
+                        value = local_value;
+                    }
+                    drop(shared_value);
+                }
+                for _ in 0..work_between_critical_sections {
+                    local_value += value;
+                    local_value *= 1.01;
+                    value = local_value;
+                }
+                iterations += 1;
+            }
+            tx.send((iterations, value)).await.unwrap();
+        });
+    }
+
+    thread::sleep(Duration::new(seconds_per_test as u64, 0));
+    keep_going.store(false, Ordering::Relaxed);
+
+    drop((wtx, rtx));
+    block_on(join(wrx.map(|x| x.0).collect(), rrx.map(|x| x.0).collect()))
+}
+
+fn run_nsync_benchmark_iterations(
+    num_writer_tasks: usize,
+    num_reader_tasks: usize,
+    work_per_critical_section: usize,
+    work_between_critical_sections: usize,
+    seconds_per_test: usize,
+    test_iterations: usize,
+    ex: ThreadPool,
+) {
+    let mut writers = vec![];
+    let mut readers = vec![];
+
+    for _ in 0..test_iterations {
+        let (run_writers, run_readers) = run_nsync_benchmark(
+            num_writer_tasks,
+            num_reader_tasks,
+            work_per_critical_section,
+            work_between_critical_sections,
+            seconds_per_test,
+            ex.clone(),
+        );
+        writers.extend_from_slice(&run_writers);
+        readers.extend_from_slice(&run_readers);
+    }
+
+    let total_writers = writers.iter().fold(0f64, |a, b| a + *b as f64) / test_iterations as f64;
+    let total_readers = readers.iter().fold(0f64, |a, b| a + *b as f64) / test_iterations as f64;
+    println!(
+        "{:20} - [write] {:10.3} kHz [read] {:10.3} kHz",
+        "nsync::Mutex",
+        total_writers as f64 / seconds_per_test as f64 / 1000.0,
+        total_readers as f64 / seconds_per_test as f64 / 1000.0
+    );
+}
+
+fn run_benchmark<M: RwLock<f64> + Send + Sync + 'static>(
+    num_writer_tasks: usize,
+    num_reader_tasks: usize,
+    work_per_critical_section: usize,
+    work_between_critical_sections: usize,
+    seconds_per_test: usize,
+    ex: ThreadPool,
+) -> (Vec<usize>, Vec<usize>) {
+    let lock = Arc::new(([0u8; 300], M::new(0.0), [0u8; 300]));
+    let keep_going = Arc::new(AtomicBool::new(true));
+    let (wtx, wrx) = channel(num_writer_tasks);
+    for _ in 0..num_writer_tasks {
+        let lock = lock.clone();
+        let keep_going = keep_going.clone();
+        let mut tx = wtx.clone();
+        ex.spawn_ok(async move {
+            let mut local_value = 0.0;
+            let mut value = 0.0;
+            let mut iterations = 0usize;
             while keep_going.load(Ordering::Relaxed) {
                 lock.1.write(|shared_value| {
                     for _ in 0..work_per_critical_section {
@@ -230,18 +345,18 @@ fn run_benchmark<M: RwLock<f64> + Send + Sync + 'static>(
                 }
                 iterations += 1;
             }
-            (iterations, value)
-        }));
+            tx.send((iterations, value)).await.unwrap();
+        });
     }
-    for _ in 0..num_reader_threads {
-        let barrier = barrier.clone();
+    let (rtx, rrx) = channel(num_reader_tasks);
+    for _ in 0..num_reader_tasks {
         let lock = lock.clone();
         let keep_going = keep_going.clone();
-        readers.push(thread::spawn(move || {
+        let mut tx = rtx.clone();
+        ex.spawn_ok(async move {
             let mut local_value = 0.0;
             let mut value = 0.0;
             let mut iterations = 0usize;
-            barrier.wait();
             while keep_going.load(Ordering::Relaxed) {
                 lock.1.read(|shared_value| {
                     for _ in 0..work_per_critical_section {
@@ -257,43 +372,37 @@ fn run_benchmark<M: RwLock<f64> + Send + Sync + 'static>(
                 }
                 iterations += 1;
             }
-            (iterations, value)
-        }));
+            tx.send((iterations, value)).await.unwrap();
+        });
     }
 
     thread::sleep(Duration::new(seconds_per_test as u64, 0));
     keep_going.store(false, Ordering::Relaxed);
 
-    let run_writers = writers
-        .into_iter()
-        .map(|x| x.join().unwrap().0)
-        .collect::<Vec<usize>>();
-    let run_readers = readers
-        .into_iter()
-        .map(|x| x.join().unwrap().0)
-        .collect::<Vec<usize>>();
-
-    (run_writers, run_readers)
+    drop((wtx, rtx));
+    block_on(join(wrx.map(|x| x.0).collect(), rrx.map(|x| x.0).collect()))
 }
 
 fn run_benchmark_iterations<M: RwLock<f64> + Send + Sync + 'static>(
-    num_writer_threads: usize,
-    num_reader_threads: usize,
+    num_writer_tasks: usize,
+    num_reader_tasks: usize,
     work_per_critical_section: usize,
     work_between_critical_sections: usize,
     seconds_per_test: usize,
     test_iterations: usize,
+    ex: ThreadPool,
 ) {
     let mut writers = vec![];
     let mut readers = vec![];
 
     for _ in 0..test_iterations {
         let (run_writers, run_readers) = run_benchmark::<M>(
-            num_writer_threads,
-            num_reader_threads,
+            num_writer_tasks,
+            num_reader_tasks,
             work_per_critical_section,
             work_between_critical_sections,
             seconds_per_test,
+            ex.clone(),
         );
         writers.extend_from_slice(&run_writers);
         readers.extend_from_slice(&run_readers);
@@ -312,20 +421,20 @@ fn run_benchmark_iterations<M: RwLock<f64> + Send + Sync + 'static>(
 fn run_all(
     args: &[ArgRange],
     first: &mut bool,
-    num_writer_threads: usize,
-    num_reader_threads: usize,
+    num_writer_tasks: usize,
+    num_reader_tasks: usize,
     work_per_critical_section: usize,
     work_between_critical_sections: usize,
     seconds_per_test: usize,
     test_iterations: usize,
 ) {
-    if num_writer_threads == 0 && num_reader_threads == 0 {
+    if num_writer_tasks == 0 && num_reader_tasks == 0 {
         return;
     }
     if *first || !args[0].is_single() || !args[1].is_single() {
         println!(
-            "- Running with {} writer threads and {} reader threads",
-            num_writer_threads, num_reader_threads
+            "- Running with {} writer tasks and {} reader tasks",
+            num_writer_tasks, num_reader_tasks
         );
     }
     if *first || !args[2].is_single() || !args[3].is_single() {
@@ -339,55 +448,67 @@ fn run_all(
     }
     *first = false;
 
+    let ex = ThreadPool::new().unwrap();
     run_benchmark_iterations::<parking_lot::RwLock<f64>>(
-        num_writer_threads,
-        num_reader_threads,
+        num_writer_tasks,
+        num_reader_tasks,
         work_per_critical_section,
         work_between_critical_sections,
         seconds_per_test,
         test_iterations,
+        ex.clone(),
+    );
+    run_nsync_benchmark_iterations(
+        num_writer_tasks,
+        num_reader_tasks,
+        work_per_critical_section,
+        work_between_critical_sections,
+        seconds_per_test,
+        test_iterations,
+        ex.clone(),
     );
     run_benchmark_iterations::<seqlock::SeqLock<f64>>(
-        num_writer_threads,
-        num_reader_threads,
+        num_writer_tasks,
+        num_reader_tasks,
         work_per_critical_section,
         work_between_critical_sections,
         seconds_per_test,
         test_iterations,
+        ex.clone(),
     );
-    if cfg!(windows) {
-        run_benchmark_iterations::<std::sync::RwLock<f64>>(
-            num_writer_threads,
-            num_reader_threads,
-            work_per_critical_section,
-            work_between_critical_sections,
-            seconds_per_test,
-            test_iterations,
-        );
-    }
+    run_benchmark_iterations::<std::sync::RwLock<f64>>(
+        num_writer_tasks,
+        num_reader_tasks,
+        work_per_critical_section,
+        work_between_critical_sections,
+        seconds_per_test,
+        test_iterations,
+        ex.clone(),
+    );
     if cfg!(unix) {
         run_benchmark_iterations::<PthreadRwLock<f64>>(
-            num_writer_threads,
-            num_reader_threads,
+            num_writer_tasks,
+            num_reader_tasks,
             work_per_critical_section,
             work_between_critical_sections,
             seconds_per_test,
             test_iterations,
+            ex.clone(),
         );
     }
 }
 fn main() {
     let args = args::parse(&[
-        "numWriterThreads",
-        "numReaderThreads",
+        "numWriterTasks",
+        "numReaderTasks",
         "workPerCriticalSection",
         "workBetweenCriticalSections",
         "secondsPerTest",
         "testIterations",
     ]);
     let mut first = true;
-    for num_writer_threads in args[0] {
-        for num_reader_threads in args[1] {
+    for num_writer_tasks in args[0] {
+        for num_reader_tasks in args[1] {
             for work_per_critical_section in args[2] {
                 for work_between_critical_sections in args[3] {
                     for seconds_per_test in args[4] {
@@ -395,8 +516,8 @@ fn main() {
                             run_all(
                                 &args,
                                 &mut first,
-                                num_writer_threads,
-                                num_reader_threads,
+                                num_writer_tasks,
+                                num_reader_tasks,
                                 work_per_critical_section,
                                 work_between_critical_sections,
                                 seconds_per_test,
