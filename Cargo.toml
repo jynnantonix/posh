@@ -1,0 +1,18 @@
+[package]
+name = "nsync"
+authors = ["Chirantan Ekbote", "The Chromium OS Authors"]
+license = "Apache-2.0 AND BSD-3-Clause"
+version = "0.1.0"
+keywords = ["mutex", "condvar", "rwlock", "async"]
+categories = ["asynchronous", "concurrency"]
+edition = "2021"
+
+[dependencies]
+intrusive-collections = "0.9.3"
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+futures = { version = "0.3", features = ["executor"] }
+futures-executor = { version = "0.3", features = ["thread-pool"] }
+futures-util = "0.3"
+tempfile = "3"
