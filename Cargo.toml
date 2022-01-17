@@ -6,6 +6,7 @@ version = "0.1.0"
 keywords = ["mutex", "condvar", "rwlock", "async", "no_std"]
 categories = ["asynchronous", "concurrency"]
 edition = "2021"
+exclude = ["benchmark"]
 
 [features]
 default = ["std"]
