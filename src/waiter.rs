@@ -31,7 +31,6 @@ enum State {
     Waiting(Waker),
     Woken,
     Finished,
-    Processing,
 }
 
 // Indicates the queue to which the waiter belongs. It is the responsibility of the Mutex and
@@ -48,12 +47,14 @@ pub enum WaitingFor {
     Condvar = 2,
 }
 
+pub trait Cancel {
+    fn cancel(&self, waiter: &Waiter, wake_next: bool);
+}
+
 // Represents a thread currently blocked on a Condvar or on acquiring a Mutex.
 pub struct Waiter {
     link: AtomicLink,
     state: SpinLock<State>,
-    cancel: fn(usize, &Waiter, bool),
-    cancel_data: usize,
     kind: Kind,
     waiting_for: AtomicU8,
 }
@@ -79,15 +80,11 @@ impl Waiter {
     // documentation of the `WaitingFor` enum for the meaning of the different values.
     pub fn new(
         kind: Kind,
-        cancel: fn(usize, &Waiter, bool),
-        cancel_data: usize,
         waiting_for: WaitingFor,
     ) -> Waiter {
         Waiter {
             link: AtomicLink::new(),
             state: SpinLock::new(State::Init),
-            cancel,
-            cancel_data,
             kind,
             waiting_for: AtomicU8::new(waiting_for as u8),
         }
@@ -133,8 +130,8 @@ impl Waiter {
     }
 
     // Wait until woken up by another thread.
-    pub fn wait(&self) -> WaitFuture<'_> {
-        WaitFuture { waiter: self }
+    pub fn wait<'w, 'c, C: Cancel>(&'w self, owner: &'c C) -> WaitFuture<'w, 'c, C> {
+        WaitFuture { waiter: self, owner }
     }
 
     // Wake up the thread associated with this `Waiter`. Panics if `waiting_for()` does not return
@@ -152,29 +149,31 @@ impl Waiter {
     }
 }
 
-pub struct WaitFuture<'w> {
+pub struct WaitFuture<'w, 'c, C: Cancel> {
     waiter: &'w Waiter,
+    owner: &'c C,
 }
 
-impl<'w> Future for WaitFuture<'w> {
+impl<'w, 'c, C: Cancel> Future for WaitFuture<'w, 'c, C> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         let mut state = self.waiter.state.lock();
 
-        match mem::replace(&mut *state, State::Processing) {
+        match &*state {
             State::Init => {
                 *state = State::Waiting(cx.waker().clone());
 
                 Poll::Pending
             }
-            State::Waiting(old_waker) => {
-                *state = State::Waiting(cx.waker().clone());
+            State::Waiting(w) if !w.will_wake(cx.waker()) => {
+                let old_waker = mem::replace(&mut *state, State::Waiting(cx.waker().clone()));
                 mem::drop(state);
                 mem::drop(old_waker);
 
                 Poll::Pending
             }
+            State::Waiting(_) => Poll::Pending,
             State::Woken => {
                 *state = State::Finished;
                 Poll::Ready(())
@@ -182,31 +181,27 @@ impl<'w> Future for WaitFuture<'w> {
             State::Finished => {
                 panic!("Future polled after returning Poll::Ready");
             }
-            State::Processing => {
-                panic!("Unexpected waker state");
-            }
         }
     }
 }
 
-impl<'w> Drop for WaitFuture<'w> {
+impl<'w, 'c, C: Cancel> Drop for WaitFuture<'w, 'c, C> {
     fn drop(&mut self) {
         let state = self.waiter.state.lock();
 
         match *state {
             State::Finished => {}
-            State::Processing => panic!("Unexpected waker state"),
             State::Woken => {
                 mem::drop(state);
 
                 // We were woken but not polled.  Wake up the next waiter.
-                (self.waiter.cancel)(self.waiter.cancel_data, self.waiter, true);
+                self.owner.cancel(self.waiter, true);
             }
             _ => {
                 mem::drop(state);
 
                 // Not woken.  No need to wake up any waiters.
-                (self.waiter.cancel)(self.waiter.cancel_data, self.waiter, false);
+                self.owner.cancel(self.waiter, false);
             }
         }
     }

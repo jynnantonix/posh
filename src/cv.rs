@@ -13,7 +13,7 @@ use std::{
 
 use crate::{
     mu::{MutexGuard, MutexReadGuard, RawMutex},
-    waiter::{Kind as WaiterKind, Waiter, WaiterAdapter, WaiterList, WaitingFor},
+    waiter::{self, Kind as WaiterKind, Waiter, WaiterAdapter, WaiterList, WaitingFor},
 };
 
 const SPINLOCK: usize = 1 << 0;
@@ -126,12 +126,7 @@ impl Condvar {
     // that doesn't compile.
     #[allow(clippy::needless_lifetimes)]
     pub async fn wait<'g, T>(&self, guard: MutexGuard<'g, T>) -> MutexGuard<'g, T> {
-        let waiter = Arc::new(Waiter::new(
-            WaiterKind::Exclusive,
-            cancel_waiter,
-            self as *const Condvar as usize,
-            WaitingFor::Condvar,
-        ));
+        let waiter = Arc::new(Waiter::new(WaiterKind::Exclusive, WaitingFor::Condvar));
 
         self.add_waiter(waiter.clone(), guard.as_raw_mutex());
 
@@ -139,7 +134,7 @@ impl Condvar {
         let mu = guard.into_inner();
 
         // Wait to be woken up.
-        waiter.wait().await;
+        waiter.wait(self).await;
 
         // Now re-acquire the lock.
         mu.lock_from_cv().await
@@ -150,12 +145,7 @@ impl Condvar {
     // that doesn't compile.
     #[allow(clippy::needless_lifetimes)]
     pub async fn wait_read<'g, T>(&self, guard: MutexReadGuard<'g, T>) -> MutexReadGuard<'g, T> {
-        let waiter = Arc::new(Waiter::new(
-            WaiterKind::Shared,
-            cancel_waiter,
-            self as *const Condvar as usize,
-            WaitingFor::Condvar,
-        ));
+        let waiter = Arc::new(Waiter::new(WaiterKind::Shared, WaitingFor::Condvar));
 
         self.add_waiter(waiter.clone(), guard.as_raw_mutex());
 
@@ -163,7 +153,7 @@ impl Condvar {
         let mu = guard.into_inner();
 
         // Wait to be woken up.
-        waiter.wait().await;
+        waiter.wait(self).await;
 
         // Now re-acquire the lock.
         mu.read_lock_from_cv().await
@@ -317,8 +307,13 @@ impl Condvar {
             w.wake();
         }
     }
+}
 
-    fn cancel_waiter(&self, waiter: &Waiter, wake_next: bool) {
+unsafe impl Send for Condvar {}
+unsafe impl Sync for Condvar {}
+
+impl waiter::Cancel for Condvar {
+    fn cancel(&self, waiter: &Waiter, wake_next: bool) {
         let mut oldstate = self.state.load(Ordering::Relaxed);
         while oldstate & SPINLOCK != 0
             || self
@@ -378,10 +373,6 @@ impl Condvar {
         mem::drop(old_waiter);
     }
 }
-
-unsafe impl Send for Condvar {}
-unsafe impl Sync for Condvar {}
-
 impl Default for Condvar {
     fn default() -> Self {
         Self::new()
@@ -439,14 +430,6 @@ fn get_wake_list(waiters: &mut WaiterList) -> WaiterList {
     }
 
     to_wake
-}
-
-fn cancel_waiter(cv: usize, waiter: &Waiter, wake_next: bool) {
-    let condvar = cv as *const Condvar;
-
-    // Safe because the task that owns the waiter being canceled must also own a reference to the
-    // Condvar, which guarantees that this pointer is valid.
-    unsafe { (*condvar).cancel_waiter(waiter, wake_next) }
 }
 
 #[cfg(test)]

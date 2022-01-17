@@ -13,7 +13,7 @@ use std::{
     thread::yield_now,
 };
 
-use crate::waiter::{Kind as WaiterKind, Waiter, WaiterAdapter, WaiterList, WaitingFor};
+use crate::waiter::{Kind as WaiterKind, Waiter, WaiterAdapter, WaiterList, WaitingFor, self};
 
 // Set when the mutex is exclusively locked.
 const LOCKED: usize = 1 << 0;
@@ -69,7 +69,7 @@ trait Kind {
     fn clear_on_acquire() -> usize;
 
     // The waiter that a task should use when waiting to acquire this kind of lock.
-    fn new_waiter(raw: &RawMutex) -> Arc<Waiter>;
+    fn new_waiter() -> Arc<Waiter>;
 }
 
 // A lock type for shared read-only access to the data. More than one task may hold this kind of
@@ -93,11 +93,9 @@ impl Kind for Shared {
         0
     }
 
-    fn new_waiter(raw: &RawMutex) -> Arc<Waiter> {
+    fn new_waiter() -> Arc<Waiter> {
         Arc::new(Waiter::new(
             WaiterKind::Shared,
-            cancel_waiter,
-            raw as *const RawMutex as usize,
             WaitingFor::Mutex,
         ))
     }
@@ -124,11 +122,9 @@ impl Kind for Exclusive {
         WRITER_WAITING
     }
 
-    fn new_waiter(raw: &RawMutex) -> Arc<Waiter> {
+    fn new_waiter() -> Arc<Waiter> {
         Arc::new(Waiter::new(
             WaiterKind::Exclusive,
-            cancel_waiter,
-            raw as *const RawMutex as usize,
             WaitingFor::Mutex,
         ))
     }
@@ -284,7 +280,7 @@ impl RawMutex {
             } else if (oldstate & SPINLOCK) == 0 {
                 // The mutex is locked and the spin lock is available.  Try to add this task
                 // to the waiter queue.
-                let w = waiter.get_or_insert_with(|| K::new_waiter(self));
+                let w = waiter.get_or_insert_with(K::new_waiter);
                 w.reset(WaitingFor::Mutex);
 
                 if self
@@ -337,7 +333,7 @@ impl RawMutex {
                     }
 
                     // Now wait until we are woken.
-                    w.wait().await;
+                    w.wait(self).await;
 
                     // The `DESIGNATED_WAKER` bit gets set when this task is woken up by the
                     // task that originally held the lock. While this bit is set, no other waiters
@@ -507,7 +503,13 @@ impl RawMutex {
         }
     }
 
-    fn cancel_waiter(&self, waiter: &Waiter, wake_next: bool) {
+}
+
+unsafe impl Send for RawMutex {}
+unsafe impl Sync for RawMutex {}
+
+impl waiter::Cancel for RawMutex {
+    fn cancel(&self, waiter: &Waiter, wake_next: bool) {
         let mut oldstate = self.state.load(Ordering::Relaxed);
         while oldstate & SPINLOCK != 0
             || self
@@ -605,18 +607,6 @@ impl RawMutex {
 
         mem::drop(old_waiter);
     }
-}
-
-unsafe impl Send for RawMutex {}
-unsafe impl Sync for RawMutex {}
-
-fn cancel_waiter(raw: usize, waiter: &Waiter, wake_next: bool) {
-    let raw_mutex = raw as *const RawMutex;
-
-    // Safe because the task that owns the waiter that is being canceled must
-    // also own a reference to the mutex, which ensures that this pointer is
-    // valid.
-    unsafe { (*raw_mutex).cancel_waiter(waiter, wake_next) }
 }
 
 /// A high-level primitive that provides safe, mutable access to a shared resource.
