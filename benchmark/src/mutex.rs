@@ -376,7 +376,7 @@ fn run_all(
         "name", "total", "average", "median", "std.dev."
     );
 
-    let ex = ThreadPool::new().unwrap();
+    let ex = ThreadPool::builder().pool_size(num_tasks).create().unwrap();
 
     run_benchmark_iterations::<parking_lot::Mutex<f64>>(
         num_tasks,
