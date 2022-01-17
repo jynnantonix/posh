@@ -42,7 +42,7 @@ const HAS_WAITERS: usize = 1 << 1;
 ///
 /// # Examples
 ///
-/// ```edition2018
+/// ```
 /// use std::sync::Arc;
 /// use std::thread;
 /// use std::sync::mpsc::channel;

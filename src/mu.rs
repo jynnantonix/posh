@@ -678,7 +678,7 @@ fn cancel_waiter(mu: *const (), waiter: &Waiter, wake_next: bool) {
 ///
 /// # Examples
 ///
-/// ```edition2018
+/// ```
 /// use std::sync::Arc;
 /// use std::thread;
 /// use std::sync::mpsc::channel;
