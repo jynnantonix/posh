@@ -201,6 +201,7 @@ fn get_wake_list(waiters: &mut WaiterList) -> (WaiterList, usize) {
     (to_wake, set_on_release)
 }
 
+#[repr(align(128))]
 pub(crate) struct RawMutex {
     state: AtomicUsize,
     waiters: UnsafeCell<WaiterList>,
@@ -712,7 +713,6 @@ fn cancel_waiter(mu: *const (), waiter: &Waiter, wake_next: bool) {
 ///
 /// rx.recv().unwrap();
 /// ```
-#[repr(align(128))]
 pub struct Mutex<T: ?Sized> {
     raw: RawMutex,
     value: UnsafeCell<T>,
