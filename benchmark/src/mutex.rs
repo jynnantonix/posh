@@ -25,6 +25,36 @@ use futures::{
     SinkExt, StreamExt,
 };
 
+struct Barrier {
+    mu: posh::Mutex<usize>,
+    cv: posh::Condvar,
+}
+
+impl Barrier {
+    fn new(count: usize) -> Barrier {
+        Barrier {
+            mu: posh::Mutex::new(count),
+            cv: posh::Condvar::new(),
+        }
+    }
+
+    async fn wait(&self) {
+        let mut count = self.mu.lock().await;
+        let oldcount = *count;
+        *count -= 1;
+        drop(count);
+
+        if oldcount == 1 {
+            self.cv.notify_all();
+        } else {
+            let mut count = self.mu.read_lock().await;
+            while *count > 0 {
+                count = self.cv.wait_read(count).await;
+            }
+        }
+    }
+}
+
 trait Mutex<T> {
     fn new(v: T) -> Self;
     fn lock<F, R>(&self, f: F) -> R
@@ -149,16 +179,19 @@ fn run_posh_benchmark(
     ex: ThreadPool,
 ) -> Vec<usize> {
     let lock = Arc::new(([0u8; 300], posh::Mutex::new(0.0), [0u8; 300]));
+    let barrier = Arc::new(Barrier::new(num_tasks));
     let keep_going = Arc::new(AtomicBool::new(true));
     let (tx, rx) = channel(num_tasks);
     for _ in 0..num_tasks {
         let lock = lock.clone();
+        let barrier = barrier.clone();
         let keep_going = keep_going.clone();
         let mut tx = tx.clone();
         ex.spawn_ok(async move {
             let mut local_value = 0.0;
             let mut value = 0.0;
             let mut iterations = 0usize;
+            barrier.wait().await;
             while keep_going.load(Ordering::Relaxed) {
                 {
                     let mut shared_value = lock.1.lock().await;
@@ -193,8 +226,8 @@ fn run_posh_benchmark_iterations(
     work_between_critical_sections: usize,
     seconds_per_test: usize,
     test_iterations: usize,
+    ex: ThreadPool,
 ) {
-    let ex = ThreadPool::new().unwrap();
     let mut data = vec![];
     for _ in 0..test_iterations {
         let run_data = run_posh_benchmark(
@@ -234,16 +267,19 @@ fn run_benchmark<M: Mutex<f64> + Send + Sync + 'static>(
     ex: ThreadPool,
 ) -> Vec<usize> {
     let lock = Arc::new(([0u8; 300], M::new(0.0), [0u8; 300]));
+    let barrier = Arc::new(Barrier::new(num_tasks));
     let keep_going = Arc::new(AtomicBool::new(true));
     let (tx, rx) = channel(num_tasks);
     for _ in 0..num_tasks {
         let lock = lock.clone();
+        let barrier = barrier.clone();
         let keep_going = keep_going.clone();
         let mut tx = tx.clone();
         ex.spawn_ok(async move {
             let mut local_value = 0.0;
             let mut value = 0.0;
             let mut iterations = 0usize;
+            barrier.wait().await;
             while keep_going.load(Ordering::Relaxed) {
                 lock.1.lock(|shared_value| {
                     for _ in 0..work_per_critical_section {
@@ -276,9 +312,9 @@ fn run_benchmark_iterations<M: Mutex<f64> + Send + Sync + 'static>(
     work_between_critical_sections: usize,
     seconds_per_test: usize,
     test_iterations: usize,
+    ex: ThreadPool,
 ) {
     let mut data = vec![];
-    let ex = ThreadPool::new().unwrap();
     for _ in 0..test_iterations {
         let run_data = run_benchmark::<M>(
             num_tasks,
@@ -340,13 +376,7 @@ fn run_all(
         "name", "total", "average", "median", "std.dev."
     );
 
-    run_posh_benchmark_iterations(
-        num_tasks,
-        work_per_critical_section,
-        work_between_critical_sections,
-        seconds_per_test,
-        test_iterations,
-    );
+    let ex = ThreadPool::new().unwrap();
 
     run_benchmark_iterations::<parking_lot::Mutex<f64>>(
         num_tasks,
@@ -354,6 +384,16 @@ fn run_all(
         work_between_critical_sections,
         seconds_per_test,
         test_iterations,
+        ex.clone(),
+    );
+
+    run_posh_benchmark_iterations(
+        num_tasks,
+        work_per_critical_section,
+        work_between_critical_sections,
+        seconds_per_test,
+        test_iterations,
+        ex.clone(),
     );
 
     run_benchmark_iterations::<std::sync::Mutex<f64>>(
@@ -362,6 +402,7 @@ fn run_all(
         work_between_critical_sections,
         seconds_per_test,
         test_iterations,
+        ex.clone(),
     );
     if cfg!(windows) {
         run_benchmark_iterations::<SrwLock<f64>>(
@@ -370,6 +411,7 @@ fn run_all(
             work_between_critical_sections,
             seconds_per_test,
             test_iterations,
+            ex.clone(),
         );
     }
     if cfg!(unix) {
@@ -379,6 +421,7 @@ fn run_all(
             work_between_critical_sections,
             seconds_per_test,
             test_iterations,
+            ex.clone(),
         );
     }
 }
