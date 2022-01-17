@@ -60,7 +60,9 @@ const READ_LOCK: usize = 1 << 8;
 const READ_MASK: usize = !0xff;
 
 // The number of times the task should just spin and attempt to re-acquire the lock.
-const SPIN_THRESHOLD: usize = 7;
+const SPIN_THRESHOLD: usize = 10;
+// The number of times the task should issue a `hint::spin_loop()` rather than yielding while spinning.
+const RELAX_THRESHOLD: usize = 5;
 
 // The number of times the task needs to go through the wait queue before it sets the `LONG_WAIT`
 // bit and forces all other tasks to wait for it to acquire the lock. This value is set relatively
@@ -291,8 +293,30 @@ impl RawMutex {
                     .is_ok()
                 {
                     return;
+                } else {
+                    hint::spin_loop();
+                    continue;
                 }
-            } else if (oldstate & SPINLOCK) == 0 {
+            }
+
+            if (clear & DESIGNATED_WAKER) == 0
+                && (oldstate & HAS_WAITERS) == 0
+                && spin_count < SPIN_THRESHOLD
+            {
+                // If we're not responsible for clearing the DESIGNATED_WAKER bit, we don't already
+                // have waiters in the queue, and we haven't been spinning for too long, spin and
+                // try again.
+                spin_count += 1;
+                if spin_count <= RELAX_THRESHOLD {
+                    cpu_relax(1 << spin_count);
+                } else {
+                    yield_now().await;
+                }
+
+                continue;
+            }
+
+            if (oldstate & SPINLOCK) == 0 {
                 // The mutex is locked and the spin lock is available.  Try to add this task
                 // to the waiter queue.
 
@@ -397,7 +421,7 @@ impl RawMutex {
                 spin_count += 1;
             }
 
-            if spin_count < SPIN_THRESHOLD || (clear & DESIGNATED_WAKER) != 0 {
+            if spin_count < RELAX_THRESHOLD || (clear & DESIGNATED_WAKER) != 0 {
                 cpu_relax(1 << spin_count);
             } else {
                 yield_now().await;
@@ -1435,8 +1459,10 @@ mod test {
         let g = block_on(mu.lock());
 
         for r in &mut futures {
-            if let Poll::Ready(()) = r.as_mut().poll(&mut cx) {
-                panic!("future unexpectedly ready");
+            for _ in 0..=(SPIN_THRESHOLD - RELAX_THRESHOLD) {
+                if let Poll::Ready(()) = r.as_mut().poll(&mut cx) {
+                    panic!("future unexpectedly ready");
+                }
             }
         }
 
@@ -1519,7 +1545,16 @@ mod test {
         let waker = waker_ref(&arc_waker);
         let mut cx = Context::from_waker(&waker);
 
-        for _ in 0..=LONG_WAIT_THRESHOLD {
+        for _ in 0..=(SPIN_THRESHOLD - RELAX_THRESHOLD) {
+            if let Poll::Ready(()) = tl.as_mut().poll(&mut cx) {
+                panic!("tight_loop unexpectedly ready");
+            }
+
+            if let Poll::Ready(()) = mark.as_mut().poll(&mut cx) {
+                panic!("mark_ready unexpectedly ready");
+            }
+        }
+        for _ in 0..LONG_WAIT_THRESHOLD {
             if let Poll::Ready(()) = tl.as_mut().poll(&mut cx) {
                 panic!("tight_loop unexpectedly ready");
             }
@@ -1577,7 +1612,16 @@ mod test {
         let waker = waker_ref(&arc_waker);
         let mut cx = Context::from_waker(&waker);
 
-        for _ in 0..=LONG_WAIT_THRESHOLD {
+        for _ in 0..=(SPIN_THRESHOLD - RELAX_THRESHOLD) {
+            if let Poll::Ready(()) = tl.as_mut().poll(&mut cx) {
+                panic!("tight_loop unexpectedly ready");
+            }
+
+            if let Poll::Ready(()) = mark.as_mut().poll(&mut cx) {
+                panic!("mark_ready unexpectedly ready");
+            }
+        }
+        for _ in 0..LONG_WAIT_THRESHOLD {
             if let Poll::Ready(()) = tl.as_mut().poll(&mut cx) {
                 panic!("tight_loop unexpectedly ready");
             }
@@ -1624,7 +1668,16 @@ mod test {
         let waker = waker_ref(&arc_waker);
         let mut cx = Context::from_waker(&waker);
 
-        for _ in 0..=LONG_WAIT_THRESHOLD {
+        for _ in 0..=(SPIN_THRESHOLD - RELAX_THRESHOLD) {
+            if let Poll::Ready(()) = tl.as_mut().poll(&mut cx) {
+                panic!("tight_loop unexpectedly ready");
+            }
+
+            if let Poll::Ready(()) = mark.as_mut().poll(&mut cx) {
+                panic!("mark_ready unexpectedly ready");
+            }
+        }
+        for _ in 0..LONG_WAIT_THRESHOLD {
             if let Poll::Ready(()) = tl.as_mut().poll(&mut cx) {
                 panic!("tight_loop unexpectedly ready");
             }
@@ -1681,11 +1734,13 @@ mod test {
 
         // Poll 2 futures. Since neither will be able to acquire the lock, they should get added to
         // the waiter list.
-        if let Poll::Ready(()) = futures[0].as_mut().poll(&mut cx) {
-            panic!("future unexpectedly ready");
-        }
-        if let Poll::Ready(()) = futures[1].as_mut().poll(&mut cx) {
-            panic!("future unexpectedly ready");
+        for _ in 0..=(SPIN_THRESHOLD - RELAX_THRESHOLD) {
+            if futures[0].as_mut().poll(&mut cx).is_ready() {
+                panic!("future unexpectedly ready");
+            }
+            if futures[1].as_mut().poll(&mut cx).is_ready() {
+                panic!("future unexpectedly ready");
+            }
         }
 
         assert_eq!(
@@ -1783,14 +1838,16 @@ mod test {
 
         // Now poll the futures. Since the lock is acquired they will both get queued in the waiter
         // list.
-        match fut1.as_mut().poll(&mut cx) {
-            Poll::Pending => {}
-            Poll::Ready(()) => panic!("Future is unexpectedly ready"),
-        }
+        for _ in 0..=(SPIN_THRESHOLD - RELAX_THRESHOLD) {
+            match fut1.as_mut().poll(&mut cx) {
+                Poll::Pending => {}
+                Poll::Ready(()) => panic!("Future is unexpectedly ready"),
+            }
 
-        match fut2.as_mut().poll(&mut cx) {
-            Poll::Pending => {}
-            Poll::Ready(()) => panic!("Future is unexpectedly ready"),
+            match fut2.as_mut().poll(&mut cx) {
+                Poll::Pending => {}
+                Poll::Ready(()) => panic!("Future is unexpectedly ready"),
+            }
         }
 
         assert_eq!(
@@ -1846,14 +1903,16 @@ mod test {
 
         // Now poll the futures. Since the lock is acquired they will both get queued in the waiter
         // list.
-        match fut1.as_mut().poll(&mut cx) {
-            Poll::Pending => {}
-            Poll::Ready(()) => panic!("Future is unexpectedly ready"),
-        }
+        for _ in 0..=(SPIN_THRESHOLD - RELAX_THRESHOLD) {
+            match fut1.as_mut().poll(&mut cx) {
+                Poll::Pending => {}
+                Poll::Ready(()) => panic!("Future is unexpectedly ready"),
+            }
 
-        match fut2.as_mut().poll(&mut cx) {
-            Poll::Pending => {}
-            Poll::Ready(()) => panic!("Future is unexpectedly ready"),
+            match fut2.as_mut().poll(&mut cx) {
+                Poll::Pending => {}
+                Poll::Ready(()) => panic!("Future is unexpectedly ready"),
+            }
         }
 
         assert_eq!(
@@ -1914,8 +1973,10 @@ mod test {
         let g = block_on(mu.lock());
 
         // Poll the future.
-        if let Poll::Ready(()) = timeout.as_mut().poll(&mut cx) {
-            panic!("timed_lock unexpectedly ready");
+        for _ in 0..=(SPIN_THRESHOLD - RELAX_THRESHOLD) {
+            if let Poll::Ready(()) = timeout.as_mut().poll(&mut cx) {
+                panic!("timed_lock unexpectedly ready");
+            }
         }
 
         assert_eq!(
@@ -1981,8 +2042,10 @@ mod test {
             2 * READ_LOCK
         );
 
-        if let Poll::Ready(()) = w.as_mut().poll(&mut cx) {
-            panic!("inc unexpectedly ready");
+        for _ in 0..=(SPIN_THRESHOLD - RELAX_THRESHOLD) {
+            if let Poll::Ready(()) = w.as_mut().poll(&mut cx) {
+                panic!("inc unexpectedly ready");
+            }
         }
         assert_eq!(
             mu.raw.state.load(Ordering::Relaxed) & WRITER_WAITING,
@@ -2064,8 +2127,10 @@ mod test {
 
         // Poll the readers and the writer so they add themselves to the mutex's waiter list.
         for r in &mut readers {
-            if r.as_mut().poll(&mut cx).is_ready() {
-                panic!("reader unexpectedly ready");
+            for _ in 0..=(SPIN_THRESHOLD - RELAX_THRESHOLD) {
+                if r.as_mut().poll(&mut cx).is_ready() {
+                    panic!("reader unexpectedly ready");
+                }
             }
         }
 
@@ -2205,8 +2270,10 @@ mod test {
 
         // Now poll the lock function. Since the lock is held by us, it will get queued on the
         // waiter list.
-        if let Poll::Ready(()) = l.as_mut().poll(&mut cx) {
-            panic!("lock() unexpectedly ready");
+        for _ in 0..=(SPIN_THRESHOLD - RELAX_THRESHOLD) {
+            if let Poll::Ready(()) = l.as_mut().poll(&mut cx) {
+                panic!("lock() unexpectedly ready");
+            }
         }
 
         assert_eq!(
