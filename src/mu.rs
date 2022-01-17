@@ -2,18 +2,22 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::{
+use core::{
     cell::UnsafeCell,
-    hint, mem,
+    hint,
+    marker::PhantomData,
     ops::{Deref, DerefMut},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-    thread::yield_now,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
-use crate::waiter::{Kind as WaiterKind, Waiter, WaiterAdapter, WaiterList, WaitingFor, self};
+use intrusive_collections::UnsafeRef;
+use pin_utils::pin_mut;
+
+use crate::{
+    cpu_relax,
+    waiter::{Kind as WaiterKind, Waiter, WaiterAdapter, WaiterList, WaitingFor},
+    yield_now,
+};
 
 // Set when the mutex is exclusively locked.
 const LOCKED: usize = 1 << 0;
@@ -69,7 +73,7 @@ trait Kind {
     fn clear_on_acquire() -> usize;
 
     // The waiter that a task should use when waiting to acquire this kind of lock.
-    fn new_waiter() -> Arc<Waiter>;
+    unsafe fn new_waiter(mu: *const RawMutex) -> Waiter;
 }
 
 // A lock type for shared read-only access to the data. More than one task may hold this kind of
@@ -93,11 +97,13 @@ impl Kind for Shared {
         0
     }
 
-    fn new_waiter() -> Arc<Waiter> {
-        Arc::new(Waiter::new(
+    unsafe fn new_waiter(mu: *const RawMutex) -> Waiter {
+        Waiter::new(
             WaiterKind::Shared,
             WaitingFor::Mutex,
-        ))
+            cancel_waiter,
+            mu as *const (),
+        )
     }
 }
 
@@ -122,11 +128,13 @@ impl Kind for Exclusive {
         WRITER_WAITING
     }
 
-    fn new_waiter() -> Arc<Waiter> {
-        Arc::new(Waiter::new(
+    unsafe fn new_waiter(mu: *const RawMutex) -> Waiter {
+        Waiter::new(
             WaiterKind::Exclusive,
             WaitingFor::Mutex,
-        ))
+            cancel_waiter,
+            mu as *const (),
+        )
     }
 }
 
@@ -177,13 +185,6 @@ fn get_wake_list(waiters: &mut WaiterList) -> (WaiterList, usize) {
     }
 
     (to_wake, set_on_release)
-}
-
-#[inline]
-fn cpu_relax(iterations: usize) {
-    for _ in 0..iterations {
-        hint::spin_loop();
-    }
 }
 
 pub(crate) struct RawMutex {
@@ -259,7 +260,6 @@ impl RawMutex {
 
         let mut spin_count = 0;
         let mut wait_count = 0;
-        let mut waiter = None;
         loop {
             let oldstate = self.state.load(Ordering::Relaxed);
             //  If all the bits in `zero_to_acquire` are actually zero then try to acquire the lock
@@ -280,9 +280,6 @@ impl RawMutex {
             } else if (oldstate & SPINLOCK) == 0 {
                 // The mutex is locked and the spin lock is available.  Try to add this task
                 // to the waiter queue.
-                let w = waiter.get_or_insert_with(K::new_waiter);
-                w.reset(WaitingFor::Mutex);
-
                 if self
                     .state
                     .compare_exchange_weak(
@@ -293,18 +290,33 @@ impl RawMutex {
                     )
                     .is_ok()
                 {
+                    // Safety: The returned waiter does not escape this function, which guarantees
+                    // that the RawMutex will outlive the Waiter.
+                    let waiter = unsafe { K::new_waiter(self) };
+                    pin_mut!(waiter);
+
+                    // Safety: The waiter is pinned and will not be moved. Additionally, the
+                    // Waiter's drop impl guarantees that it will be removed from the list before it
+                    // is dropped. Technically, we're aliasing mutable memory here because
+                    // `Future::poll` requires mutably borrowing the whole struct. However, in
+                    // practice the Future impl only touches `Waiter::state` and `Waiter::kind`,
+                    // while the linked list only touches `Waiter::link` so we _should_ be fine.
+                    // Maybe we can wrap the link with something like `UnsafeAliasedCell` once
+                    // https://github.com/rust-lang/rust/issues/63818 is fixed.
+                    let waiter_ref = unsafe { UnsafeRef::from_raw(&*waiter) };
+
                     let mut set_on_release = 0;
 
                     // Safe because we have acquired the spin lock and it provides exclusive
                     // access to the waiter queue.
                     if wait_count < LONG_WAIT_THRESHOLD {
                         // Add the waiter to the back of the queue.
-                        unsafe { (*self.waiters.get()).push_back(w.clone()) };
+                        unsafe { (*self.waiters.get()).push_back(waiter_ref) };
                     } else {
                         // This waiter has gone through the queue too many times. Put it in the
                         // front of the queue and block all other tasks from acquiring the lock
                         // until this one has acquired it at least once.
-                        unsafe { (*self.waiters.get()).push_front(w.clone()) };
+                        unsafe { (*self.waiters.get()).push_front(waiter_ref) };
 
                         // Set the LONG_WAIT bit to prevent all other tasks from acquiring the
                         // lock.
@@ -319,21 +331,23 @@ impl RawMutex {
                     }
 
                     // Release the spin lock.
-                    let mut state = oldstate;
-                    loop {
-                        match self.state.compare_exchange_weak(
+                    let mut state = (oldstate | SPINLOCK | HAS_WAITERS | K::set_when_waiting()) & !clear;
+                    while self
+                        .state
+                        .compare_exchange_weak(
                             state,
                             (state | set_on_release) & !SPINLOCK,
                             Ordering::Release,
                             Ordering::Relaxed,
-                        ) {
-                            Ok(_) => break,
-                            Err(w) => state = w,
-                        }
+                        )
+                        .is_err()
+                    {
+                        hint::spin_loop();
+                        state = self.state.load(Ordering::Relaxed);
                     }
 
                     // Now wait until we are woken.
-                    w.wait(self).await;
+                    waiter.await;
 
                     // The `DESIGNATED_WAKER` bit gets set when this task is woken up by the
                     // task that originally held the lock. While this bit is set, no other waiters
@@ -360,12 +374,17 @@ impl RawMutex {
             // Both the lock and the spin lock are held by one or more other tasks. First, we'll
             // spin a few times in case we can acquire the lock or the spin lock. If that fails then
             // we yield because we might be preventing the tasks that do hold the 2 locks from
-            // getting cpu time.
+            // getting cpu time. However, if we're responsible for clearing the DESIGNATED_WAKER bit
+            // then we cannot yield because we might get dropped while awaiting the yield and then
+            // nothing will clear that bit.
             if spin_count < SPIN_THRESHOLD {
-                cpu_relax(1 << spin_count);
                 spin_count += 1;
+            }
+
+            if spin_count < SPIN_THRESHOLD || (clear & DESIGNATED_WAKER) != 0 {
+                cpu_relax(1 << spin_count);
             } else {
-                yield_now();
+                yield_now().await;
             }
         }
     }
@@ -470,22 +489,24 @@ impl RawMutex {
                     // bit, which needs to be set when we are waking up a bunch of readers and there
                     // are still writers in the wait queue. This will prevent any readers that
                     // aren't in `wake_list` from acquiring the read lock.
-                    let mut state = oldstate;
-                    loop {
-                        match self.state.compare_exchange_weak(
+                    let mut state = oldstate | SPINLOCK | DESIGNATED_WAKER;
+                    while self
+                        .state
+                        .compare_exchange_weak(
                             state,
                             (state | set_on_release) & !clear,
                             Ordering::Release,
                             Ordering::Relaxed,
-                        ) {
-                            Ok(_) => break,
-                            Err(w) => state = w,
-                        }
+                        )
+                        .is_err()
+                    {
+                        hint::spin_loop();
+                        state = self.state.load(Ordering::Relaxed);
                     }
 
                     // Now wake the waiters, if any.
                     for w in wake_list {
-                        w.wake();
+                        Waiter::wake(w);
                     }
 
                     // We're done.
@@ -493,22 +514,14 @@ impl RawMutex {
                 }
             }
 
-            // Spin and try again.  It's ok to block here as we have already released the lock.
+            // Spin and try again.
+            cpu_relax(1 << spin_count);
             if spin_count < SPIN_THRESHOLD {
-                cpu_relax(1 << spin_count);
                 spin_count += 1;
-            } else {
-                yield_now();
             }
         }
     }
 
-}
-
-unsafe impl Send for RawMutex {}
-unsafe impl Sync for RawMutex {}
-
-impl waiter::Cancel for RawMutex {
     fn cancel(&self, waiter: &Waiter, wake_next: bool) {
         let mut oldstate = self.state.load(Ordering::Relaxed);
         while oldstate & SPINLOCK != 0
@@ -543,7 +556,7 @@ impl waiter::Cancel for RawMutex {
             || waiters
                 .front()
                 .get()
-                .map(|front| std::ptr::eq(front, waiter))
+                .map(|front| core::ptr::eq(front, waiter))
                 .unwrap_or(false)
         {
             clear |= LONG_WAIT;
@@ -587,6 +600,7 @@ impl waiter::Cancel for RawMutex {
             clear |= WRITER_WAITING;
         }
 
+        oldstate |= SPINLOCK;
         while self
             .state
             .compare_exchange_weak(
@@ -602,11 +616,24 @@ impl waiter::Cancel for RawMutex {
         }
 
         for w in wake_list {
-            w.wake();
+            Waiter::wake(w);
         }
 
-        mem::drop(old_waiter);
+        if let Some(w) = old_waiter {
+            Waiter::cancel(w);
+        }
     }
+}
+
+unsafe impl Send for RawMutex {}
+unsafe impl Sync for RawMutex {}
+
+fn cancel_waiter(mu: *const (), waiter: &Waiter, wake_next: bool) {
+    // Safety: This is called when the Waiter is dropped and the task that owns the Waiter must also
+    // own a reference to the RawMutex (otherwise it wouldn't be able to create the Waiter in the
+    // first place).
+    let mu = mu as *const RawMutex;
+    unsafe { (*mu).cancel(waiter, wake_next) }
 }
 
 /// A high-level primitive that provides safe, mutable access to a shared resource.
@@ -713,7 +740,7 @@ impl<T: ?Sized> Mutex<T> {
         // Safe because we have exclusive access to `self.value`.
         MutexGuard {
             mu: self,
-            value: unsafe { &mut *self.value.get() },
+            marker: PhantomData,
         }
     }
 
@@ -735,7 +762,7 @@ impl<T: ?Sized> Mutex<T> {
         // Safe because we have shared read-only access to `self.value`.
         MutexReadGuard {
             mu: self,
-            value: unsafe { &*self.value.get() },
+            marker: PhantomData,
         }
     }
 
@@ -747,7 +774,7 @@ impl<T: ?Sized> Mutex<T> {
         // Safe because we have exclusive access to `self.value`.
         MutexGuard {
             mu: self,
-            value: unsafe { &mut *self.value.get() },
+            marker: PhantomData,
         }
     }
 
@@ -763,7 +790,7 @@ impl<T: ?Sized> Mutex<T> {
         // Safe because we have exclusive access to `self.value`.
         MutexReadGuard {
             mu: self,
-            value: unsafe { &*self.value.get() },
+            marker: PhantomData,
         }
     }
 
@@ -804,7 +831,7 @@ impl<T> From<T> for Mutex<T> {
 /// the `Deref` and `DerefMut` implementations of this structure.
 pub struct MutexGuard<'a, T: ?Sized + 'a> {
     mu: &'a Mutex<T>,
-    value: &'a mut T,
+    marker: PhantomData<&'a mut T>,
 }
 
 impl<'a, T: ?Sized> MutexGuard<'a, T> {
@@ -821,13 +848,15 @@ impl<'a, T: ?Sized> Deref for MutexGuard<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        self.value
+        // Safety: This `MutexGuard` provides exclusive access to the underlying value.
+        unsafe { &*self.mu.value.get() }
     }
 }
 
 impl<'a, T: ?Sized> DerefMut for MutexGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.value
+        // Safety: This `MutexGuard` provides exclusive access to the underlying value.
+        unsafe { &mut *self.mu.value.get() }
     }
 }
 
@@ -842,7 +871,7 @@ impl<'a, T: ?Sized> Drop for MutexGuard<'a, T> {
 /// implementation of this structure.
 pub struct MutexReadGuard<'a, T: ?Sized + 'a> {
     mu: &'a Mutex<T>,
-    value: &'a T,
+    marker: PhantomData<&'a T>,
 }
 
 impl<'a, T: ?Sized> MutexReadGuard<'a, T> {
@@ -859,7 +888,8 @@ impl<'a, T: ?Sized> Deref for MutexReadGuard<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        self.value
+        // Safety: This `MutexReadGuard` provides shared access to the underlying value.
+        unsafe { &*self.mu.value.get() }
     }
 }
 
@@ -1316,7 +1346,7 @@ mod test {
             for _ in 0..ITERATIONS {
                 let tmp = *guard;
                 *guard = -1;
-                thread::yield_now();
+                yield_now().await;
                 *guard = tmp + 1;
             }
 

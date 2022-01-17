@@ -2,18 +2,18 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::{
+use core::{
     cell::UnsafeCell,
-    hint, mem,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+    hint, ptr,
+    sync::atomic::{AtomicUsize, Ordering},
 };
+
+use intrusive_collections::UnsafeRef;
+use pin_utils::pin_mut;
 
 use crate::{
     mu::{MutexGuard, MutexReadGuard, RawMutex},
-    waiter::{self, Kind as WaiterKind, Waiter, WaiterAdapter, WaiterList, WaitingFor},
+    waiter::{Kind as WaiterKind, Waiter, WaiterAdapter, WaiterList, WaitingFor},
 };
 
 const SPINLOCK: usize = 1 << 0;
@@ -65,7 +65,7 @@ const HAS_WAITERS: usize = 1 << 1;
 pub struct Condvar {
     state: AtomicUsize,
     waiters: UnsafeCell<WaiterList>,
-    mu: UnsafeCell<usize>,
+    mu: UnsafeCell<*const RawMutex>,
 }
 
 impl Condvar {
@@ -74,7 +74,7 @@ impl Condvar {
         Condvar {
             state: AtomicUsize::new(0),
             waiters: UnsafeCell::new(WaiterList::new(WaiterAdapter::new())),
-            mu: UnsafeCell::new(0),
+            mu: UnsafeCell::new(ptr::null()),
         }
     }
 
@@ -126,15 +126,35 @@ impl Condvar {
     // that doesn't compile.
     #[allow(clippy::needless_lifetimes)]
     pub async fn wait<'g, T>(&self, guard: MutexGuard<'g, T>) -> MutexGuard<'g, T> {
-        let waiter = Arc::new(Waiter::new(WaiterKind::Exclusive, WaitingFor::Condvar));
+        // Safety: The Waiter does not escape this function, which guarantees that the Condvar will
+        // outlive the Waiter.
+        let waiter = unsafe {
+            Waiter::new(
+                WaiterKind::Exclusive,
+                WaitingFor::Condvar,
+                cancel_waiter,
+                self as *const Condvar as *const (),
+            )
+        };
+        pin_mut!(waiter);
 
-        self.add_waiter(waiter.clone(), guard.as_raw_mutex());
+        // Safety: The waiter is pinned and will not be moved. Additionally, the Waiter's drop impl
+        // guarantees that it will be removed from the list before it is dropped. Technically, we're
+        // aliasing mutable memory here because `Future::poll` requires mutably borrowing the whole
+        // struct. However, in practice the Future impl only touches `Waiter::state` and
+        // `Waiter::kind`, while the linked list only touches `Waiter::link` so we _should_ be fine.
+        // Maybe we can wrap the link with something like `UnsafeAliasedCell` once
+        // https://github.com/rust-lang/rust/issues/63818 is fixed.
+        self.add_waiter(
+            unsafe { UnsafeRef::from_raw(&*waiter) },
+            guard.as_raw_mutex(),
+        );
 
         // Get a reference to the mutex and then drop the lock.
         let mu = guard.into_inner();
 
         // Wait to be woken up.
-        waiter.wait(self).await;
+        waiter.await;
 
         // Now re-acquire the lock.
         mu.lock_from_cv().await
@@ -145,21 +165,42 @@ impl Condvar {
     // that doesn't compile.
     #[allow(clippy::needless_lifetimes)]
     pub async fn wait_read<'g, T>(&self, guard: MutexReadGuard<'g, T>) -> MutexReadGuard<'g, T> {
-        let waiter = Arc::new(Waiter::new(WaiterKind::Shared, WaitingFor::Condvar));
+        // Safety: The Waiter does not escape this function, which guarantees that the Condvar will
+        // outlive the Waiter.
+        let waiter = unsafe {
+            Waiter::new(
+                WaiterKind::Shared,
+                WaitingFor::Condvar,
+                cancel_waiter,
+                self as *const Condvar as *const (),
+            )
+        };
 
-        self.add_waiter(waiter.clone(), guard.as_raw_mutex());
+        pin_mut!(waiter);
+
+        // Safety: The waiter is pinned and will not be moved. Additionally, the Waiter's drop impl
+        // guarantees that it will be removed from the list before it is dropped. Technically, we're
+        // aliasing mutable memory here because `Future::poll` requires mutably borrowing the whole
+        // struct. However, in practice the Future impl only touches `Waiter::state` and
+        // `Waiter::kind`, while the linked list only touches `Waiter::link` so we _should_ be fine.
+        // Maybe we can wrap the link with something like `UnsafeAliasedCell` once
+        // https://github.com/rust-lang/rust/issues/63818 is fixed.
+        self.add_waiter(
+            unsafe { UnsafeRef::from_raw(&*waiter) },
+            guard.as_raw_mutex(),
+        );
 
         // Get a reference to the mutex and then drop the lock.
         let mu = guard.into_inner();
 
         // Wait to be woken up.
-        waiter.wait(self).await;
+        waiter.await;
 
         // Now re-acquire the lock.
         mu.read_lock_from_cv().await
     }
 
-    fn add_waiter(&self, waiter: Arc<Waiter>, raw_mutex: &RawMutex) {
+    fn add_waiter(&self, waiter: UnsafeRef<Waiter>, raw_mutex: &RawMutex) {
         // Acquire the spin lock.
         let mut oldstate = self.state.load(Ordering::Relaxed);
         while (oldstate & SPINLOCK) != 0
@@ -180,12 +221,12 @@ impl Condvar {
         // Safe because the spin lock guarantees exclusive access and the reference does not escape
         // this function.
         let mu = unsafe { &mut *self.mu.get() };
-        let muptr = raw_mutex as *const RawMutex as usize;
+        let muptr = raw_mutex as *const RawMutex;
 
-        match *mu {
-            0 => *mu = muptr,
-            p if p == muptr => {}
-            _ => panic!("Attempting to use Condvar with more than one Mutex at the same time"),
+        if mu.is_null() {
+            *mu = muptr;
+        } else if *mu != muptr {
+            panic!("Attempting to use Condvar with more than one Mutex at the same time");
         }
 
         // Safe because the spin lock guarantees exclusive access.
@@ -237,7 +278,7 @@ impl Condvar {
         let newstate = if waiters.is_empty() {
             // Also clear the mutex associated with this Condvar since there are no longer any
             // waiters.  Safe because the spin lock guarantees exclusive access.
-            unsafe { *self.mu.get() = 0 };
+            unsafe { *self.mu.get() = ptr::null() };
 
             // We are releasing the spin lock and there are no more waiters so we can clear all bits
             // in `self.state`.
@@ -252,7 +293,7 @@ impl Condvar {
 
         // Now wake any waiters in the wake list.
         for w in wake_list {
-            w.wake();
+            Waiter::wake(w);
         }
     }
 
@@ -292,7 +333,7 @@ impl Condvar {
 
         // Clear the mutex associated with this Condvar since there are no longer any waiters. Safe
         // because we the spin lock guarantees exclusive access.
-        unsafe { *self.mu.get() = 0 };
+        unsafe { *self.mu.get() = ptr::null() };
 
         // Mark any waiters left as no longer waiting for the Condvar.
         for w in &wake_list {
@@ -304,15 +345,10 @@ impl Condvar {
 
         // Now wake any waiters in the wake list.
         for w in wake_list {
-            w.wake();
+            Waiter::wake(w);
         }
     }
-}
 
-unsafe impl Send for Condvar {}
-unsafe impl Sync for Condvar {}
-
-impl waiter::Cancel for Condvar {
     fn cancel(&self, waiter: &Waiter, wake_next: bool) {
         let mut oldstate = self.state.load(Ordering::Relaxed);
         while oldstate & SPINLOCK != 0
@@ -342,6 +378,10 @@ impl waiter::Cancel for Condvar {
             let mut cursor = unsafe { waiters.cursor_mut_from_ptr(waiter as *const Waiter) };
             cursor.remove()
         } else {
+            // The waiter has already been moved to a temporary waiter list.  Wait for it to be unlinked.
+            while waiter.is_linked() {
+                hint::spin_loop();
+            }
             None
         };
 
@@ -356,7 +396,7 @@ impl waiter::Cancel for Condvar {
         let set_on_release = if waiters.is_empty() {
             // Clear the mutex associated with this Condvar since there are no longer any waiters. Safe
             // because we the spin lock guarantees exclusive access.
-            unsafe { *self.mu.get() = 0 };
+            unsafe { *self.mu.get() = ptr::null() };
 
             0
         } else {
@@ -367,12 +407,18 @@ impl waiter::Cancel for Condvar {
 
         // Now wake any waiters still left in the wake list.
         for w in wake_list {
-            w.wake();
+            Waiter::wake(w);
         }
 
-        mem::drop(old_waiter);
+        if let Some(w) = old_waiter {
+            Waiter::cancel(w);
+        }
     }
 }
+
+unsafe impl Send for Condvar {}
+unsafe impl Sync for Condvar {}
+
 impl Default for Condvar {
     fn default() -> Self {
         Self::new()
@@ -430,6 +476,14 @@ fn get_wake_list(waiters: &mut WaiterList) -> WaiterList {
     }
 
     to_wake
+}
+
+fn cancel_waiter(cv: *const (), waiter: &Waiter, wake_next: bool) {
+    let cv = cv as *const Condvar;
+
+    // Safety: This function is called when a Waiter is dropped and the task that owns the Waiter
+    // must also own a reference to the Condvar.
+    unsafe { (*cv).cancel(waiter, wake_next) }
 }
 
 #[cfg(test)]

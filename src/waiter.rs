@@ -2,23 +2,21 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::{
+use core::{
     future::Future,
+    marker::PhantomPinned,
     mem,
     pin::Pin,
-    sync::{
-        atomic::{AtomicU8, Ordering},
-        Arc,
-    },
     task::{Context, Poll, Waker},
 };
 
 use intrusive_collections::{
     intrusive_adapter,
     linked_list::{AtomicLink, LinkedList},
+    UnsafeRef,
 };
 
-use crate::spin::SpinLock;
+use crate::{cpu_relax, spin::SpinLock};
 
 #[derive(Clone, Copy)]
 pub enum Kind {
@@ -31,32 +29,37 @@ enum State {
     Waiting(Waker),
     Woken,
     Finished,
+    Canceled,
 }
+
+struct Inner {
+    state: State,
+    cancel: fn(*const (), &Waiter, bool),
+    owner: *const (),
+    waiting_for: WaitingFor,
+}
+
+unsafe impl Send for Inner {}
 
 // Indicates the queue to which the waiter belongs. It is the responsibility of the Mutex and
 // Condvar implementations to update this value when adding/removing a Waiter from their respective
 // waiter lists.
-#[repr(u8)]
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum WaitingFor {
     // The waiter is either not linked into  a waiter list or it is linked into a temporary list.
-    None = 0,
+    None,
     // The waiter is linked into the Mutex's waiter list.
-    Mutex = 1,
+    Mutex,
     // The waiter is linked into the Condvar's waiter list.
-    Condvar = 2,
-}
-
-pub trait Cancel {
-    fn cancel(&self, waiter: &Waiter, wake_next: bool);
+    Condvar,
 }
 
 // Represents a thread currently blocked on a Condvar or on acquiring a Mutex.
 pub struct Waiter {
+    inner: SpinLock<Inner>,
     link: AtomicLink,
-    state: SpinLock<State>,
     kind: Kind,
-    waiting_for: AtomicU8,
+    _pinned: PhantomPinned,
 }
 
 impl Waiter {
@@ -78,15 +81,24 @@ impl Waiter {
     //
     // `waiting_for` indicates the waiter list to which this `Waiter` will be added. See the
     // documentation of the `WaitingFor` enum for the meaning of the different values.
-    pub fn new(
+    //
+    // Safety: Callers must ensure that `owner` outlives this `Waiter`.
+    pub unsafe fn new(
         kind: Kind,
         waiting_for: WaitingFor,
+        cancel: fn(*const (), &Waiter, bool),
+        owner: *const (),
     ) -> Waiter {
         Waiter {
+            inner: SpinLock::new(Inner {
+                state: State::Init,
+                cancel,
+                owner,
+                waiting_for,
+            }),
             link: AtomicLink::new(),
-            state: SpinLock::new(State::Init),
             kind,
-            waiting_for: AtomicU8::new(waiting_for as u8),
+            _pinned: PhantomPinned,
         }
     }
 
@@ -102,111 +114,122 @@ impl Waiter {
 
     // Indicates the waiter list to which this `Waiter` belongs.
     pub fn is_waiting_for(&self) -> WaitingFor {
-        match self.waiting_for.load(Ordering::Acquire) {
-            0 => WaitingFor::None,
-            1 => WaitingFor::Mutex,
-            2 => WaitingFor::Condvar,
-            v => panic!("Unknown value for `WaitingFor`: {}", v),
-        }
+        self.inner.lock().waiting_for
     }
 
-    // Change the waiter list to which this `Waiter` belongs. This will panic if called when the
-    // `Waiter` is still linked into a waiter list.
+    // Change the waiter list to which this `Waiter` belongs.
     pub fn set_waiting_for(&self, waiting_for: WaitingFor) {
-        self.waiting_for.store(waiting_for as u8, Ordering::Release);
+        self.inner.lock().waiting_for = waiting_for;
     }
 
-    // Reset the Waiter back to its initial state. Panics if this `Waiter` is still linked into a
-    // waiter list.
-    pub fn reset(&self, waiting_for: WaitingFor) {
-        debug_assert!(!self.is_linked(), "Cannot reset `Waiter` while linked");
-        self.set_waiting_for(waiting_for);
-
-        let mut state = self.state.lock();
-        if let State::Waiting(waker) = mem::replace(&mut *state, State::Init) {
-            mem::drop(state);
-            mem::drop(waker);
-        }
-    }
-
-    // Wait until woken up by another thread.
-    pub fn wait<'w, 'c, C: Cancel>(&'w self, owner: &'c C) -> WaitFuture<'w, 'c, C> {
-        WaitFuture { waiter: self, owner }
+    pub fn cancel(waiter: UnsafeRef<Waiter>) {
+        debug_assert!(!waiter.is_linked(), "Cannot cancel `Waiter` while linked");
+        waiter.inner.lock().state = State::Finished;
     }
 
     // Wake up the thread associated with this `Waiter`. Panics if `waiting_for()` does not return
     // `WaitingFor::None` or if `is_linked()` returns true.
-    pub fn wake(&self) {
-        debug_assert!(!self.is_linked(), "Cannot wake `Waiter` while linked");
-        debug_assert_eq!(self.is_waiting_for(), WaitingFor::None);
+    pub fn wake(waiter: UnsafeRef<Waiter>) {
+        debug_assert!(!waiter.is_linked(), "Cannot wake `Waiter` while linked");
+        debug_assert_eq!(waiter.is_waiting_for(), WaitingFor::None);
 
-        let mut state = self.state.lock();
+        let mut inner = waiter.inner.lock();
 
-        if let State::Waiting(waker) = mem::replace(&mut *state, State::Woken) {
-            mem::drop(state);
-            waker.wake();
+        match mem::replace(&mut inner.state, State::Woken) {
+            State::Waiting(waker) => {
+                drop(inner);
+                waker.wake();
+            }
+            State::Canceled => {
+                inner.state = State::Finished;
+            }
+            _ => {}
         }
     }
 }
 
-pub struct WaitFuture<'w, 'c, C: Cancel> {
-    waiter: &'w Waiter,
-    owner: &'c C,
-}
-
-impl<'w, 'c, C: Cancel> Future for WaitFuture<'w, 'c, C> {
+impl Future for Waiter {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let mut state = self.waiter.state.lock();
+        let mut inner = self.inner.lock();
 
-        match &*state {
+        match &inner.state {
             State::Init => {
-                *state = State::Waiting(cx.waker().clone());
+                inner.state = State::Waiting(cx.waker().clone());
 
                 Poll::Pending
             }
             State::Waiting(w) if !w.will_wake(cx.waker()) => {
-                let old_waker = mem::replace(&mut *state, State::Waiting(cx.waker().clone()));
-                mem::drop(state);
-                mem::drop(old_waker);
+                let old_waker = mem::replace(&mut inner.state, State::Waiting(cx.waker().clone()));
+                drop(inner);
+                drop(old_waker);
 
                 Poll::Pending
             }
             State::Waiting(_) => Poll::Pending,
             State::Woken => {
-                *state = State::Finished;
+                inner.state = State::Finished;
                 Poll::Ready(())
             }
-            State::Finished => {
-                panic!("Future polled after returning Poll::Ready");
+            State::Canceled | State::Finished => {
+                panic!("Future polled after returning Poll::Ready or being canceled");
             }
         }
     }
 }
 
-impl<'w, 'c, C: Cancel> Drop for WaitFuture<'w, 'c, C> {
+impl Drop for Waiter {
     fn drop(&mut self) {
-        let state = self.waiter.state.lock();
+        let mut inner = self.inner.lock();
 
-        match *state {
+        match &inner.state {
             State::Finished => {}
             State::Woken => {
-                mem::drop(state);
+                // We were woken but not polled. Go directly to `State::Finished` since nothing is
+                // going to poll, wake, or cancel us now.
+                inner.state = State::Finished;
+                let cancel = inner.cancel;
+                let owner = inner.owner;
+                drop(inner);
 
-                // We were woken but not polled.  Wake up the next waiter.
-                self.owner.cancel(self.waiter, true);
+                // Since we were woken but didn't get a chance to run, wake up the next waiter.
+                cancel(owner, self, true);
+
+                inner = self.inner.lock();
             }
+            State::Canceled => panic!("Waiter dropped twice"),
             _ => {
-                mem::drop(state);
+                inner.state = State::Canceled;
+                let cancel = inner.cancel;
+                let owner = inner.owner;
+                drop(inner);
 
                 // Not woken.  No need to wake up any waiters.
-                self.owner.cancel(self.waiter, false);
+                cancel(owner, self, false);
+
+                inner = self.inner.lock();
             }
+        }
+
+        // Wait until we reach `State::Finished`. This guarantees that the UnsafeRef that we handed
+        // to the linked list has been dropped.
+        let mut spin_count = 0;
+        while !matches!(inner.state, State::Finished) {
+            // If we haven't yet reached `State::Finished`, then that means that the `Waiter` was
+            // transferred to a temporary list in another task in preparation of being woken up.
+            // Wait until that task calls `Waiter::wake`, which will update the state to
+            // `State::Finished`.
+            drop(inner);
+            cpu_relax(1 << spin_count);
+            if spin_count < 7 {
+                spin_count += 1;
+            }
+            inner = self.inner.lock();
         }
     }
 }
 
-intrusive_adapter!(pub WaiterAdapter = Arc<Waiter>: Waiter { link: AtomicLink });
+intrusive_adapter!(pub WaiterAdapter = UnsafeRef<Waiter>: Waiter { link: AtomicLink });
 
 pub type WaiterList = LinkedList<WaiterAdapter>;

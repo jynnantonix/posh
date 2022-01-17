@@ -3,13 +3,18 @@ name = "nsync"
 authors = ["Chirantan Ekbote", "The Chromium OS Authors"]
 license = "Apache-2.0 AND BSD-3-Clause"
 version = "0.1.0"
-keywords = ["mutex", "condvar", "rwlock", "async"]
+keywords = ["mutex", "condvar", "rwlock", "async", "no_std"]
 categories = ["asynchronous", "concurrency"]
 edition = "2021"
 
+[features]
+default = ["std"]
+std = ["futures/alloc"]
+
 [dependencies]
-intrusive-collections = "0.9.3"
-futures = { version = "0.3", default-features = false, features = ["alloc"] }
+intrusive-collections = { version = "0.9.3", default-features = false }
+futures = { version = "0.3", default-features = false, optional = true }
+pin-utils = "0.1"
 
 [dev-dependencies]
 futures = { version = "0.3", features = ["executor"] }
