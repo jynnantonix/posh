@@ -198,6 +198,9 @@ impl Drop for Waiter {
         let mut inner = self.inner.lock();
 
         match &inner.state {
+            // If we're still in the initial state then we were never added to a waiter list and can
+            // go directly to `State::Finished`.
+            State::Init => inner.state = State::Finished,
             State::Finished => {}
             State::Woken => {
                 // We were woken but not polled. Go directly to `State::Finished` since nothing is

@@ -295,6 +295,22 @@ impl RawMutex {
             } else if (oldstate & SPINLOCK) == 0 {
                 // The mutex is locked and the spin lock is available.  Try to add this task
                 // to the waiter queue.
+
+                // Safety: The returned waiter does not escape this function, which guarantees
+                // that the RawMutex will outlive the Waiter.
+                let waiter = unsafe { K::new_waiter(self) };
+                pin_mut!(waiter);
+
+                // Safety: The waiter is pinned and will not be moved. Additionally, the
+                // Waiter's drop impl guarantees that it will be removed from the list before it
+                // is dropped. Technically, we're aliasing mutable memory here because
+                // `Future::poll` requires mutably borrowing the whole struct. However, in
+                // practice the Future impl only touches `Waiter::state` and `Waiter::kind`,
+                // while the linked list only touches `Waiter::link` so we _should_ be fine.
+                // Maybe we can wrap the link with something like `UnsafeAliasedCell` once
+                // https://github.com/rust-lang/rust/issues/63818 is fixed.
+                let waiter_ref = unsafe { UnsafeRef::from_raw(&*waiter) };
+
                 if self
                     .state
                     .compare_exchange_weak(
@@ -305,21 +321,6 @@ impl RawMutex {
                     )
                     .is_ok()
                 {
-                    // Safety: The returned waiter does not escape this function, which guarantees
-                    // that the RawMutex will outlive the Waiter.
-                    let waiter = unsafe { K::new_waiter(self) };
-                    pin_mut!(waiter);
-
-                    // Safety: The waiter is pinned and will not be moved. Additionally, the
-                    // Waiter's drop impl guarantees that it will be removed from the list before it
-                    // is dropped. Technically, we're aliasing mutable memory here because
-                    // `Future::poll` requires mutably borrowing the whole struct. However, in
-                    // practice the Future impl only touches `Waiter::state` and `Waiter::kind`,
-                    // while the linked list only touches `Waiter::link` so we _should_ be fine.
-                    // Maybe we can wrap the link with something like `UnsafeAliasedCell` once
-                    // https://github.com/rust-lang/rust/issues/63818 is fixed.
-                    let waiter_ref = unsafe { UnsafeRef::from_raw(&*waiter) };
-
                     let mut set_on_release = 0;
 
                     // Safe because we have acquired the spin lock and it provides exclusive
