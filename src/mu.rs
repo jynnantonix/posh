@@ -345,7 +345,7 @@ impl RawMutex {
                     }
 
                     // Release the spin lock.
-                    let mut state = (oldstate | SPINLOCK | HAS_WAITERS | K::set_when_waiting()) & !clear;
+                    let mut state = self.state.load(Ordering::Relaxed);
                     while self
                         .state
                         .compare_exchange_weak(
@@ -503,7 +503,7 @@ impl RawMutex {
                     // bit, which needs to be set when we are waking up a bunch of readers and there
                     // are still writers in the wait queue. This will prevent any readers that
                     // aren't in `wake_list` from acquiring the read lock.
-                    let mut state = oldstate | SPINLOCK | DESIGNATED_WAKER;
+                    let mut state = self.state.load(Ordering::Relaxed);
                     while self
                         .state
                         .compare_exchange_weak(
