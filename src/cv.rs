@@ -47,7 +47,7 @@ const HAS_WAITERS: usize = 1 << 1;
 /// use std::thread;
 /// use std::sync::mpsc::channel;
 ///
-/// use nsync::{
+/// use posh::{
 ///     block_on,
 ///     Condvar, Mutex,
 /// };
@@ -115,7 +115,7 @@ impl Condvar {
     /// # use std::sync::Arc;
     /// # use std::thread;
     ///
-    /// # use nsync::{
+    /// # use posh::{
     /// #     block_on,
     /// #     Condvar, Mutex,
     /// # };

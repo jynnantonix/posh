@@ -200,7 +200,7 @@ impl<T> Drop for PthreadRwLock<T> {
     }
 }
 
-fn run_nsync_benchmark(
+fn run_posh_benchmark(
     num_writer_tasks: usize,
     num_reader_tasks: usize,
     work_per_critical_section: usize,
@@ -208,7 +208,7 @@ fn run_nsync_benchmark(
     seconds_per_test: usize,
     ex: ThreadPool,
 ) -> (Vec<usize>, Vec<usize>) {
-    let lock = Arc::new(([0u8; 300], nsync::Mutex::new(0.0), [0u8; 300]));
+    let lock = Arc::new(([0u8; 300], posh::Mutex::new(0.0), [0u8; 300]));
     let keep_going = Arc::new(AtomicBool::new(true));
     let (wtx, wrx) = channel(num_writer_tasks);
     for _ in 0..num_writer_tasks {
@@ -276,7 +276,7 @@ fn run_nsync_benchmark(
     block_on(join(wrx.map(|x| x.0).collect(), rrx.map(|x| x.0).collect()))
 }
 
-fn run_nsync_benchmark_iterations(
+fn run_posh_benchmark_iterations(
     num_writer_tasks: usize,
     num_reader_tasks: usize,
     work_per_critical_section: usize,
@@ -289,7 +289,7 @@ fn run_nsync_benchmark_iterations(
     let mut readers = vec![];
 
     for _ in 0..test_iterations {
-        let (run_writers, run_readers) = run_nsync_benchmark(
+        let (run_writers, run_readers) = run_posh_benchmark(
             num_writer_tasks,
             num_reader_tasks,
             work_per_critical_section,
@@ -305,7 +305,7 @@ fn run_nsync_benchmark_iterations(
     let total_readers = readers.iter().fold(0f64, |a, b| a + *b as f64) / test_iterations as f64;
     println!(
         "{:20} - [write] {:10.3} kHz [read] {:10.3} kHz",
-        "nsync::Mutex",
+        "posh::Mutex",
         total_writers as f64 / seconds_per_test as f64 / 1000.0,
         total_readers as f64 / seconds_per_test as f64 / 1000.0
     );
@@ -458,7 +458,7 @@ fn run_all(
         test_iterations,
         ex.clone(),
     );
-    run_nsync_benchmark_iterations(
+    run_posh_benchmark_iterations(
         num_writer_tasks,
         num_reader_tasks,
         work_per_critical_section,

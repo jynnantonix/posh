@@ -683,7 +683,7 @@ fn cancel_waiter(mu: *const (), waiter: &Waiter, wake_next: bool) {
 /// use std::thread;
 /// use std::sync::mpsc::channel;
 ///
-/// use nsync::{block_on, Mutex};
+/// use posh::{block_on, Mutex};
 ///
 /// const N: usize = 10;
 ///

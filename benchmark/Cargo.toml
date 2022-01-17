@@ -8,7 +8,7 @@ edition = "2018"
 parking_lot = "0.11.2"
 seqlock = "0.1"
 libc = "0.2"
-nsync = { path = ".." }
+posh = { path = ".." }
 futures = { version = "0.3.19", default-features = false, features = ["alloc", "executor", "thread-pool"] }
 
 [[bin]]

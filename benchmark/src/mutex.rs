@@ -141,14 +141,14 @@ impl<T> Drop for PthreadMutex<T> {
     }
 }
 
-fn run_nsync_benchmark(
+fn run_posh_benchmark(
     num_tasks: usize,
     work_per_critical_section: usize,
     work_between_critical_sections: usize,
     seconds_per_test: usize,
     ex: ThreadPool,
 ) -> Vec<usize> {
-    let lock = Arc::new(([0u8; 300], nsync::Mutex::new(0.0), [0u8; 300]));
+    let lock = Arc::new(([0u8; 300], posh::Mutex::new(0.0), [0u8; 300]));
     let keep_going = Arc::new(AtomicBool::new(true));
     let (tx, rx) = channel(num_tasks);
     for _ in 0..num_tasks {
@@ -187,7 +187,7 @@ fn run_nsync_benchmark(
     block_on(rx.map(|x| x.0).collect())
 }
 
-fn run_nsync_benchmark_iterations(
+fn run_posh_benchmark_iterations(
     num_tasks: usize,
     work_per_critical_section: usize,
     work_between_critical_sections: usize,
@@ -197,7 +197,7 @@ fn run_nsync_benchmark_iterations(
     let ex = ThreadPool::new().unwrap();
     let mut data = vec![];
     for _ in 0..test_iterations {
-        let run_data = run_nsync_benchmark(
+        let run_data = run_posh_benchmark(
             num_tasks,
             work_per_critical_section,
             work_between_critical_sections,
@@ -218,7 +218,7 @@ fn run_nsync_benchmark_iterations(
     let k_hz = 1.0 / seconds_per_test as f64 / 1000.0;
     println!(
         "{:20} | {:10.3} kHz | {:10.3} kHz | {:10.3} kHz | {:10.3} kHz",
-        "nsync::Mutex",
+        "posh::Mutex",
         total * k_hz,
         average * k_hz,
         data[data.len() / 2] as f64 * k_hz,
@@ -340,7 +340,7 @@ fn run_all(
         "name", "total", "average", "median", "std.dev."
     );
 
-    run_nsync_benchmark_iterations(
+    run_posh_benchmark_iterations(
         num_tasks,
         work_per_critical_section,
         work_between_critical_sections,

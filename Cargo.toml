@@ -1,5 +1,5 @@
 [package]
-name = "nsync"
+name = "posh"
 authors = ["Chirantan Ekbote", "The Chromium OS Authors"]
 license = "Apache-2.0 AND BSD-3-Clause"
 version = "0.1.0"
