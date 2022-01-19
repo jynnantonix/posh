@@ -245,26 +245,19 @@ impl RawMutex {
 
     #[inline]
     pub async fn read_lock(&self) {
-        match self
-            .state
-            .compare_exchange_weak(0, READ_LOCK, Ordering::Acquire, Ordering::Relaxed)
+        let oldstate = self.state.load(Ordering::Relaxed);
+        if (oldstate & Shared::zero_to_acquire()) != 0
+            || self
+                .state
+                .compare_exchange_weak(
+                    oldstate,
+                    (oldstate + Shared::add_to_acquire()) & !Shared::clear_on_acquire(),
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
+                .is_err()
         {
-            Ok(_) => {}
-            Err(oldstate) => {
-                if (oldstate & Shared::zero_to_acquire()) != 0
-                    || self
-                        .state
-                        .compare_exchange_weak(
-                            oldstate,
-                            (oldstate + Shared::add_to_acquire()) & !Shared::clear_on_acquire(),
-                            Ordering::Acquire,
-                            Ordering::Relaxed,
-                        )
-                        .is_err()
-                {
-                    self.lock_slow::<Shared>(0, 0).await;
-                }
-            }
+            self.lock_slow::<Shared>(0, 0).await;
         }
     }
 
