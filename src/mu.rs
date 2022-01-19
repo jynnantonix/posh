@@ -294,7 +294,10 @@ impl RawMutex {
                 {
                     return;
                 } else {
-                    hint::spin_loop();
+                    if spin_count < SPIN_THRESHOLD {
+                        spin_count += 1;
+                    }
+                    cpu_relax(1 << spin_count);
                     continue;
                 }
             }
