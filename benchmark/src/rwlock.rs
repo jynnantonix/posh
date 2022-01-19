@@ -200,6 +200,13 @@ impl<T> Drop for PthreadRwLock<T> {
     }
 }
 
+async fn with_posh_lock<F, T, R>(mu: &posh::Mutex<T>, f: F) -> R
+where
+    F: FnOnce(&mut T) -> R,
+{
+    f(&mut *mu.lock().await)
+}
+
 fn run_posh_benchmark(
     num_writer_tasks: usize,
     num_reader_tasks: usize,
@@ -220,15 +227,13 @@ fn run_posh_benchmark(
             let mut value = 0.0;
             let mut iterations = 0usize;
             while keep_going.load(Ordering::Relaxed) {
-                {
-                    let mut shared_value = lock.1.lock().await;
+                with_posh_lock(&lock.1, |shared_value| {
                     for _ in 0..work_per_critical_section {
                         *shared_value += value;
                         *shared_value *= 1.01;
                         value = *shared_value;
                     }
-                    drop(shared_value);
-                }
+                }).await;
                 for _ in 0..work_between_critical_sections {
                     local_value += value;
                     local_value *= 1.01;
@@ -256,7 +261,6 @@ fn run_posh_benchmark(
                         local_value *= *shared_value;
                         value = local_value;
                     }
-                    drop(shared_value);
                 }
                 for _ in 0..work_between_critical_sections {
                     local_value += value;
