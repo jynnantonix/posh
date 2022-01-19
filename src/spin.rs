@@ -70,18 +70,17 @@ impl<T: ?Sized> SpinLock<T> {
     /// only thread with access to the resource. The `SpinLock` will be released when the returned
     /// `SpinLockGuard` is dropped. Attempting to call `lock` while already holding the `SpinLock`
     /// will cause a deadlock.
+    #[inline]
     pub fn lock(&self) -> SpinLockGuard<T> {
-        loop {
-            let state = self.lock.load(Ordering::Relaxed);
-            if state == UNLOCKED
-                && self
-                    .lock
-                    .compare_exchange_weak(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-            {
-                break;
-            }
+        let mut state = UNLOCKED;
+        while state == LOCKED
+            || self
+                .lock
+                .compare_exchange_weak(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+        {
             hint::spin_loop();
+            state = self.lock.load(Ordering::Relaxed);
         }
 
         SpinLockGuard {
@@ -90,6 +89,7 @@ impl<T: ?Sized> SpinLock<T> {
         }
     }
 
+    #[inline]
     fn unlock(&self) {
         // Don't need to compare and swap because we exclusively hold the lock.
         self.lock.store(UNLOCKED, Ordering::Release);
@@ -141,6 +141,7 @@ impl<'a, T: ?Sized> DerefMut for SpinLockGuard<'a, T> {
 }
 
 impl<'a, T: ?Sized> Drop for SpinLockGuard<'a, T> {
+    #[inline]
     fn drop(&mut self) {
         self.lock.unlock();
     }
