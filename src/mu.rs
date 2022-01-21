@@ -20,6 +20,7 @@ use core::{
     cell::UnsafeCell,
     hint,
     marker::PhantomData,
+    mem,
     ops::{Deref, DerefMut},
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -164,12 +165,12 @@ impl Kind for Exclusive {
 //
 // If the first waiter is trying to acquire an exclusive lock, then only that waiter is returned and
 // no bits are set in the returned `usize`.
-fn get_wake_list(waiters: &mut WaiterList) -> (WaiterList, usize) {
+fn get_wake_list(waiters: &mut WaiterList, only_readers: bool) -> (WaiterList, usize) {
     let mut to_wake = WaiterList::new(WaiterAdapter::new());
     let mut set_on_release = 0;
     let mut cursor = waiters.front_mut();
 
-    let mut waking_readers = false;
+    let mut waking_readers = only_readers;
     while let Some(w) = cursor.get() {
         match w.kind() {
             WaiterKind::Exclusive if !waking_readers => {
@@ -258,6 +259,42 @@ impl RawMutex {
                 .is_err()
         {
             self.lock_slow::<Shared>(0, 0).await;
+        }
+    }
+
+    #[inline]
+    fn downgrade(&self) {
+        let mut oldstate = Exclusive::add_to_acquire();
+        while self
+            .state
+            .compare_exchange_weak(
+                oldstate,
+                (oldstate + Shared::add_to_acquire() - Exclusive::add_to_acquire())
+                    & !Shared::clear_on_acquire(),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            hint::spin_loop();
+            oldstate = self.state.load(Ordering::Relaxed);
+        }
+
+        // Panic if we just tried to downgrade a mutex that wasn't held by this task. This shouldn't
+        // really be possible since `downgrade` is not a public method.
+        debug_assert_eq!(
+            oldstate & READ_MASK,
+            0,
+            "`downgrade` called on mutex held in read-mode"
+        );
+        debug_assert_ne!(
+            oldstate & LOCKED,
+            0,
+            "`downgrade` called on mutex not held in write-mode"
+        );
+
+        if (oldstate & HAS_WAITERS) != 0 && (oldstate & DESIGNATED_WAKER) == 0 {
+            self.unlock_slow(true);
         }
     }
 
@@ -446,7 +483,7 @@ impl RawMutex {
 
         if (oldstate & HAS_WAITERS) != 0 && (oldstate & DESIGNATED_WAKER) == 0 {
             // The oldstate has waiters but no designated waker has been chosen yet.
-            self.unlock_slow();
+            self.unlock_slow(false);
         }
     }
 
@@ -473,12 +510,12 @@ impl RawMutex {
         {
             // There are waiters, no designated waker has been chosen yet, and the last reader is
             // unlocking so we have to take the slow path.
-            self.unlock_slow();
+            self.unlock_slow(false);
         }
     }
 
     #[cold]
-    fn unlock_slow(&self) {
+    fn unlock_slow(&self, only_readers: bool) {
         let mut spin_count = 0;
 
         loop {
@@ -507,7 +544,7 @@ impl RawMutex {
                     // Safe because the spinlock guarantees exclusive access to the waiter list and
                     // the reference does not escape this function.
                     let waiters = unsafe { &mut *self.waiters.get() };
-                    let (wake_list, set_on_release) = get_wake_list(waiters);
+                    let (wake_list, set_on_release) = get_wake_list(waiters, only_readers);
 
                     // If the waiter list is now empty, clear the HAS_WAITERS bit.
                     if waiters.is_empty() {
@@ -613,7 +650,7 @@ impl RawMutex {
         let (wake_list, set_on_release) = if wake_next || waiting_for == WaitingFor::None {
             // Either the waiter was already woken or it's been removed from the mutex's waiter
             // list and is going to be woken. Either way, we need to wake up another task.
-            get_wake_list(waiters)
+            get_wake_list(waiters, false)
         } else {
             (WaiterList::new(WaiterAdapter::new()), 0)
         };
@@ -889,6 +926,24 @@ impl<'a, T: ?Sized> MutexGuard<'a, T> {
     pub(crate) fn as_raw_mutex(&self) -> &RawMutex {
         &self.mu.raw
     }
+
+    /// Atomically downgrades an exclusive lock into a shared lock without allowing any other tasks
+    /// to acquire an exclusive lock in between.
+    ///
+    /// Any tasks already waiting to acquire a shared lock will be woken up. However, new tasks that
+    /// try to acquire a shared lock may not be able to do so if there is already a task waiting to
+    /// acquire an exclusive lock.
+    #[inline]
+    pub fn downgrade(self) -> MutexReadGuard<'a, T> {
+        let mu = self.mu;
+        mem::forget(self);
+
+        mu.raw.downgrade();
+        MutexReadGuard {
+            mu,
+            marker: PhantomData,
+        }
+    }
 }
 
 impl<'a, T: ?Sized> Deref for MutexGuard<'a, T> {
@@ -968,7 +1023,7 @@ mod test {
     use futures::{
         channel::oneshot,
         pending, select,
-        task::{waker_ref, ArcWake},
+        task::{noop_waker_ref, waker_ref, ArcWake},
         FutureExt,
     };
     use futures_executor::{LocalPool, ThreadPool};
@@ -1926,8 +1981,8 @@ mod test {
         }
 
         assert_eq!(
-            mu.raw.state.load(Ordering::Relaxed) & WRITER_WAITING,
-            WRITER_WAITING
+            mu.raw.state.load(Ordering::Relaxed),
+            LOCKED | HAS_WAITERS | WRITER_WAITING
         );
 
         // Drop the lock.  This should mark fut1 as ready to make progress.
@@ -1938,13 +1993,7 @@ mod test {
 
         // Since there was still another waiter in the list we shouldn't have cleared the
         // DESIGNATED_WAKER bit.
-        assert_eq!(
-            mu.raw.state.load(Ordering::Relaxed) & DESIGNATED_WAKER,
-            DESIGNATED_WAKER
-        );
-
-        // Since the waiter was a writer, we should clear the WRITER_WAITING bit.
-        assert_eq!(mu.raw.state.load(Ordering::Relaxed) & WRITER_WAITING, 0);
+        assert_eq!(mu.raw.state.load(Ordering::Relaxed), DESIGNATED_WAKER);
 
         match fut2.as_mut().poll(&mut cx) {
             Poll::Pending => panic!("Future is not ready to make progress"),
@@ -2405,5 +2454,331 @@ mod test {
         }
 
         assert_eq!(mu.raw.state.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn downgrade() {
+        let mu = Mutex::new(0);
+
+        let mut guard = block_on(mu.lock());
+        *guard += 1;
+
+        assert_eq!(mu.raw.state.load(Ordering::Relaxed), LOCKED);
+
+        let guard = guard.downgrade();
+        assert_eq!(*guard, 1);
+        assert_eq!(mu.raw.state.load(Ordering::Relaxed), READ_LOCK);
+    }
+
+    #[test]
+    fn downgrade_with_waiting_readers() {
+        async fn read(mu: &Mutex<usize>) {
+            let guard = mu.read_lock().await;
+            assert_eq!(*guard, 1);
+            pending!();
+        }
+
+        let mu = Mutex::new(0);
+        let mut readers = [
+            Box::pin(read(&mu)),
+            Box::pin(read(&mu)),
+            Box::pin(read(&mu)),
+            Box::pin(read(&mu)),
+            Box::pin(read(&mu)),
+        ];
+
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+
+        let mut guard = block_on(mu.lock());
+        for _ in 0..=(SPIN_THRESHOLD - RELAX_THRESHOLD) {
+            for r in &mut readers {
+                assert!(r.as_mut().poll(&mut cx).is_pending());
+            }
+        }
+
+        assert_eq!(mu.raw.state.load(Ordering::Relaxed), LOCKED | HAS_WAITERS);
+
+        *guard = 1;
+        let _guard = guard.downgrade();
+        assert_eq!(
+            mu.raw.state.load(Ordering::Relaxed),
+            READ_LOCK | DESIGNATED_WAKER
+        );
+
+        for r in &mut readers {
+            assert!(r.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(
+            mu.raw.state.load(Ordering::Relaxed),
+            READ_LOCK * (readers.len() + 1)
+        );
+
+        for r in &mut readers {
+            assert!(r.as_mut().poll(&mut cx).is_ready());
+        }
+    }
+
+    #[test]
+    fn downgrade_with_waiting_writers() {
+        async fn write(mu: &Mutex<usize>) {
+            let mut guard = mu.lock().await;
+            *guard += 1;
+        }
+
+        let mu = Mutex::new(0);
+        let mut writers = [
+            Box::pin(write(&mu)),
+            Box::pin(write(&mu)),
+            Box::pin(write(&mu)),
+            Box::pin(write(&mu)),
+            Box::pin(write(&mu)),
+        ];
+
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+
+        let mut guard = block_on(mu.lock());
+        for _ in 0..=(SPIN_THRESHOLD - RELAX_THRESHOLD) {
+            for w in &mut writers {
+                assert!(w.as_mut().poll(&mut cx).is_pending());
+            }
+        }
+        assert_eq!(
+            mu.raw.state.load(Ordering::Relaxed),
+            LOCKED | HAS_WAITERS | WRITER_WAITING
+        );
+
+        *guard += 1;
+        let guard = guard.downgrade();
+        assert_eq!(
+            mu.raw.state.load(Ordering::Relaxed),
+            READ_LOCK | HAS_WAITERS | WRITER_WAITING
+        );
+
+        for w in &mut writers {
+            assert!(w.as_mut().poll(&mut cx).is_pending());
+        }
+
+        assert_eq!(*guard, 1);
+        drop(guard);
+
+        assert_eq!(
+            mu.raw.state.load(Ordering::Relaxed),
+            HAS_WAITERS | WRITER_WAITING | DESIGNATED_WAKER
+        );
+
+        for w in &mut writers {
+            assert!(w.as_mut().poll(&mut cx).is_ready());
+        }
+        assert_eq!(mu.raw.state.load(Ordering::Relaxed), 0);
+        assert_eq!(*block_on(mu.read_lock()), writers.len() + 1);
+    }
+
+    #[test]
+    fn downgrade_with_waiting_tasks() {
+        async fn read(mu: &Mutex<usize>) {
+            let guard = mu.read_lock().await;
+            assert_eq!(*guard, 1);
+            pending!();
+        }
+
+        async fn write(mu: &Mutex<usize>) {
+            let mut guard = mu.lock().await;
+            *guard += 1;
+        }
+
+        let mu = Mutex::new(0);
+        let mut futures: [Pin<Box<dyn Future<Output = ()>>>; 7] = [
+            Box::pin(read(&mu)),
+            Box::pin(read(&mu)),
+            Box::pin(write(&mu)),
+            Box::pin(read(&mu)),
+            Box::pin(write(&mu)),
+            Box::pin(read(&mu)),
+            Box::pin(read(&mu)),
+        ];
+
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+
+        let mut guard = block_on(mu.lock());
+        for _ in 0..=(SPIN_THRESHOLD - RELAX_THRESHOLD) {
+            for f in &mut futures {
+                assert!(f.as_mut().poll(&mut cx).is_pending());
+            }
+        }
+        assert_eq!(
+            mu.raw.state.load(Ordering::Relaxed),
+            LOCKED | HAS_WAITERS | WRITER_WAITING
+        );
+
+        *guard += 1;
+        let guard = guard.downgrade();
+        assert_eq!(
+            mu.raw.state.load(Ordering::Relaxed),
+            READ_LOCK | HAS_WAITERS | WRITER_WAITING | DESIGNATED_WAKER
+        );
+
+        for f in &mut futures {
+            assert!(f.as_mut().poll(&mut cx).is_pending());
+        }
+        assert_eq!(
+            mu.raw.state.load(Ordering::Relaxed),
+            (READ_LOCK * 6) | HAS_WAITERS | WRITER_WAITING
+        );
+
+        assert_eq!(*guard, 1);
+        drop(guard);
+        let mut unfinished = Vec::new();
+        for (idx, f) in futures.iter_mut().enumerate() {
+            if f.as_mut().poll(&mut cx).is_pending() {
+                unfinished.push(idx);
+            }
+        }
+
+        assert_eq!(
+            mu.raw.state.load(Ordering::Relaxed),
+            HAS_WAITERS | WRITER_WAITING | DESIGNATED_WAKER
+        );
+
+        for idx in unfinished {
+            assert!(futures[idx].as_mut().poll(&mut cx).is_ready());
+        }
+        assert_eq!(mu.raw.state.load(Ordering::Relaxed), 0);
+        assert_eq!(*block_on(mu.read_lock()), 3);
+    }
+
+    #[test]
+    fn rw_multi_thread_downgrade() {
+        async fn writer(mu: Arc<Mutex<isize>>, tx: Sender<()>) {
+            for _ in 0..ITERATIONS {
+                let mut count = mu.lock().await;
+                *count += 1;
+
+                if *count & 0x1 == 0 {
+                    let oldcount = *count;
+                    let count = count.downgrade();
+                    assert_eq!(*count, oldcount);
+                } else {
+                    let tmp = *count;
+                    *count = -1;
+                    yield_now().await;
+                    *count = tmp;
+                }
+            }
+
+            tx.send(()).unwrap();
+        }
+
+        async fn reader(mu: Arc<Mutex<isize>>, tx: Sender<()>) {
+            loop {
+                let guard = mu.read_lock().await;
+                assert!(*guard >= 0);
+                if *guard >= WRITERS * ITERATIONS {
+                    break;
+                }
+            }
+
+            tx.send(()).expect("Failed to send completion message");
+        }
+
+        const WRITERS: isize = 3;
+        const TASKS: isize = 7;
+        const ITERATIONS: isize = 13;
+
+        let mu = Arc::new(Mutex::new(0isize));
+        let ex = ThreadPool::new().expect("Failed to create ThreadPool");
+
+        let (txw, rxw) = channel();
+        for _ in 0..WRITERS {
+            ex.spawn_ok(writer(Arc::clone(&mu), txw.clone()));
+        }
+
+        let (txr, rxr) = channel();
+        for _ in 0..TASKS {
+            ex.spawn_ok(reader(Arc::clone(&mu), txr.clone()));
+        }
+
+        // Wait for the readers to finish their checks.
+        for _ in 0..TASKS {
+            rxr.recv_timeout(Duration::from_secs(5))
+                .expect("Failed to receive completion message from reader");
+        }
+
+        // Wait for the writers to finish.
+        for _ in 0..WRITERS {
+            rxw.recv_timeout(Duration::from_secs(5))
+                .expect("Failed to receive completion message from writer");
+        }
+
+        assert_eq!(*block_on(mu.read_lock()), WRITERS * ITERATIONS);
+        assert_eq!(mu.raw.state.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn high_contention_with_cancel_and_downgrade() {
+        const TASKS: usize = 17;
+        const ITERATIONS: usize = 103;
+
+        async fn writer(mu: &Mutex<usize>) {
+            let mut count = mu.lock().await;
+            *count += 1;
+
+            if *count & 0x1 == 0 {
+                let oldcount = *count;
+                let count = count.downgrade();
+                assert_eq!(*count, oldcount);
+            }
+        }
+
+        async fn reader(mu: &Mutex<usize>) {
+            let guard = mu.read_lock().await;
+            assert!(*guard <= TASKS * ITERATIONS);
+        }
+
+        async fn increment(mu: Arc<Mutex<usize>>, alt_mu: Arc<Mutex<usize>>, tx: Sender<()>) {
+            for _ in 0..ITERATIONS {
+                select! {
+                    () = writer(&mu).fuse() => {},
+                    () = writer(&alt_mu).fuse() => {}
+                }
+            }
+            tx.send(()).expect("Failed to send completion signal");
+        }
+
+        async fn observe(mu: Arc<Mutex<usize>>, alt_mu: Arc<Mutex<usize>>, tx: Sender<()>) {
+            for _ in 0..ITERATIONS {
+                select! {
+                    () = reader(&mu).fuse() => {},
+                    () = reader(&alt_mu).fuse() => {}
+                }
+            }
+            tx.send(()).expect("Failed to send completion signal");
+        }
+
+        let ex = ThreadPool::new().expect("Failed to create ThreadPool");
+
+        let mu = Arc::new(Mutex::new(0usize));
+        let alt_mu = Arc::new(Mutex::new(0usize));
+
+        let (tx, rx) = channel();
+        for _ in 0..TASKS {
+            ex.spawn_ok(increment(Arc::clone(&mu), Arc::clone(&alt_mu), tx.clone()));
+            ex.spawn_ok(observe(Arc::clone(&mu), Arc::clone(&alt_mu), tx.clone()));
+        }
+
+        for _ in 0..TASKS * 2 {
+            if let Err(e) = rx.recv_timeout(Duration::from_secs(10)) {
+                panic!("Error while waiting for threads to complete: {}", e);
+            }
+        }
+
+        assert_eq!(
+            *block_on(mu.read_lock()) + *block_on(alt_mu.read_lock()),
+            TASKS * ITERATIONS
+        );
+        assert_eq!(mu.raw.state.load(Ordering::Relaxed), 0);
+        assert_eq!(alt_mu.raw.state.load(Ordering::Relaxed), 0);
     }
 }
