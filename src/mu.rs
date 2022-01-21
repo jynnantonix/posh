@@ -426,7 +426,7 @@ impl RawMutex {
     }
 
     #[inline]
-    pub fn unlock(&self) {
+    fn unlock(&self) {
         // Fast path, if possible. We can directly clear the locked bit since we have exclusive
         // access to the mutex.
         let oldstate = self.state.fetch_sub(LOCKED, Ordering::Release);
@@ -451,7 +451,7 @@ impl RawMutex {
     }
 
     #[inline]
-    pub fn read_unlock(&self) {
+    fn read_unlock(&self) {
         // Fast path, if possible. We can directly subtract the READ_LOCK bit since we had
         // previously added it.
         let oldstate = self.state.fetch_sub(READ_LOCK, Ordering::Release);
@@ -908,6 +908,7 @@ impl<'a, T: ?Sized> DerefMut for MutexGuard<'a, T> {
 }
 
 impl<'a, T: ?Sized> Drop for MutexGuard<'a, T> {
+    #[inline]
     fn drop(&mut self) {
         self.mu.unlock()
     }
@@ -941,6 +942,7 @@ impl<'a, T: ?Sized> Deref for MutexReadGuard<'a, T> {
 }
 
 impl<'a, T: ?Sized> Drop for MutexReadGuard<'a, T> {
+    #[inline]
     fn drop(&mut self) {
         self.mu.read_unlock()
     }
