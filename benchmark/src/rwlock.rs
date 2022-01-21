@@ -26,6 +26,36 @@ use futures::{
     SinkExt, StreamExt,
 };
 
+struct Barrier {
+    mu: posh::Mutex<usize>,
+    cv: posh::Condvar,
+}
+
+impl Barrier {
+    fn new(count: usize) -> Barrier {
+        Barrier {
+            mu: posh::Mutex::new(count),
+            cv: posh::Condvar::new(),
+        }
+    }
+
+    async fn wait(&self) {
+        let mut count = self.mu.lock().await;
+        let oldcount = *count;
+        *count -= 1;
+        drop(count);
+
+        if oldcount == 1 {
+            self.cv.notify_all();
+        } else {
+            let mut count = self.mu.read_lock().await;
+            while *count > 0 {
+                count = self.cv.wait_read(count).await;
+            }
+        }
+    }
+}
+
 trait RwLock<T> {
     fn new(v: T) -> Self;
     fn read<F, R>(&self, f: F) -> R
@@ -200,120 +230,158 @@ impl<T> Drop for PthreadRwLock<T> {
     }
 }
 
-async fn with_posh_lock<F, T, R>(mu: &posh::Mutex<T>, f: F) -> R
-where
-    F: FnOnce(&mut T) -> R,
-{
-    f(&mut *mu.lock().await)
-}
+macro_rules! async_rwlock {
+    ($mod:ident, $ty:ty, $name:literal) => {
+        mod $mod {
+            use std::{
+                sync::{
+                    atomic::{AtomicBool, Ordering},
+                    Arc,
+                },
+                thread,
+                time::Duration,
+            };
 
-fn run_posh_benchmark(
-    num_writer_tasks: usize,
-    num_reader_tasks: usize,
-    work_per_critical_section: usize,
-    work_between_critical_sections: usize,
-    seconds_per_test: usize,
-    ex: ThreadPool,
-) -> (Vec<usize>, Vec<usize>) {
-    let lock = Arc::new(([0u8; 300], posh::Mutex::new(0.0), [0u8; 300]));
-    let keep_going = Arc::new(AtomicBool::new(true));
-    let (wtx, wrx) = channel(num_writer_tasks);
-    for _ in 0..num_writer_tasks {
-        let lock = lock.clone();
-        let keep_going = keep_going.clone();
-        let mut tx = wtx.clone();
-        ex.spawn_ok(async move {
-            let mut local_value = 0.0;
-            let mut value = 0.0;
-            let mut iterations = 0usize;
-            while keep_going.load(Ordering::Relaxed) {
-                with_posh_lock(&lock.1, |shared_value| {
-                    for _ in 0..work_per_critical_section {
-                        *shared_value += value;
-                        *shared_value *= 1.01;
-                        value = *shared_value;
-                    }
-                }).await;
-                for _ in 0..work_between_critical_sections {
-                    local_value += value;
-                    local_value *= 1.01;
-                    value = local_value;
-                }
-                iterations += 1;
+            use futures::{
+                channel::mpsc::channel,
+                executor::{block_on, ThreadPool},
+                future::join,
+                SinkExt, StreamExt,
+            };
+
+            use super::Barrier;
+
+            async fn with_lock<F, R>(mu: &$ty, f: F) -> R
+            where
+                F: FnOnce(&mut f64) -> R,
+            {
+                f(&mut *mu.write().await)
             }
-            tx.send((iterations, value)).await.unwrap();
-        });
-    }
-    let (rtx, rrx) = channel(num_reader_tasks);
-    for _ in 0..num_reader_tasks {
-        let lock = lock.clone();
-        let keep_going = keep_going.clone();
-        let mut tx = rtx.clone();
-        ex.spawn_ok(async move {
-            let mut local_value = 0.0;
-            let mut value = 0.0;
-            let mut iterations = 0usize;
-            while keep_going.load(Ordering::Relaxed) {
-                {
-                    let shared_value = lock.1.read_lock().await;
-                    for _ in 0..work_per_critical_section {
-                        local_value += value;
-                        local_value *= *shared_value;
-                        value = local_value;
-                    }
+
+            fn run_benchmark(
+                num_writer_tasks: usize,
+                num_reader_tasks: usize,
+                work_per_critical_section: usize,
+                work_between_critical_sections: usize,
+                seconds_per_test: usize,
+                ex: ThreadPool,
+            ) -> (Vec<usize>, Vec<usize>) {
+                let lock = Arc::new(([0u8; 300], <$ty>::new(0.0), [0u8; 300]));
+                let keep_going = Arc::new(AtomicBool::new(true));
+                let barrier = Arc::new(Barrier::new(num_writer_tasks + num_reader_tasks));
+                let (wtx, wrx) = channel(num_writer_tasks);
+                for _ in 0..num_writer_tasks {
+                    let lock = lock.clone();
+                    let keep_going = keep_going.clone();
+                    let barrier = barrier.clone();
+                    let mut tx = wtx.clone();
+                    ex.spawn_ok(async move {
+                        let mut local_value = 0.0;
+                        let mut value = 0.0;
+                        let mut iterations = 0usize;
+
+                        barrier.wait().await;
+                        while keep_going.load(Ordering::Relaxed) {
+                            with_lock(&lock.1, |shared_value| {
+                                for _ in 0..work_per_critical_section {
+                                    *shared_value += value;
+                                    *shared_value *= 1.01;
+                                    value = *shared_value;
+                                }
+                            })
+                            .await;
+                            for _ in 0..work_between_critical_sections {
+                                local_value += value;
+                                local_value *= 1.01;
+                                value = local_value;
+                            }
+                            iterations += 1;
+                        }
+                        tx.send((iterations, value)).await.unwrap();
+                    });
                 }
-                for _ in 0..work_between_critical_sections {
-                    local_value += value;
-                    local_value *= 1.01;
-                    value = local_value;
+                let (rtx, rrx) = channel(num_reader_tasks);
+                for _ in 0..num_reader_tasks {
+                    let lock = lock.clone();
+                    let keep_going = keep_going.clone();
+                    let barrier = barrier.clone();
+                    let mut tx = rtx.clone();
+                    ex.spawn_ok(async move {
+                        let mut local_value = 0.0;
+                        let mut value = 0.0;
+                        let mut iterations = 0usize;
+
+                        barrier.wait().await;
+                        while keep_going.load(Ordering::Relaxed) {
+                            {
+                                let shared_value = lock.1.read().await;
+                                for _ in 0..work_per_critical_section {
+                                    local_value += value;
+                                    local_value *= *shared_value;
+                                    value = local_value;
+                                }
+                            }
+                            for _ in 0..work_between_critical_sections {
+                                local_value += value;
+                                local_value *= 1.01;
+                                value = local_value;
+                            }
+                            iterations += 1;
+                        }
+                        tx.send((iterations, value)).await.unwrap();
+                    });
                 }
-                iterations += 1;
+
+                thread::sleep(Duration::new(seconds_per_test as u64, 0));
+                keep_going.store(false, Ordering::Relaxed);
+
+                drop((wtx, rtx));
+                block_on(join(wrx.map(|x| x.0).collect(), rrx.map(|x| x.0).collect()))
             }
-            tx.send((iterations, value)).await.unwrap();
-        });
-    }
 
-    thread::sleep(Duration::new(seconds_per_test as u64, 0));
-    keep_going.store(false, Ordering::Relaxed);
+            pub fn run_benchmark_iterations(
+                num_writer_tasks: usize,
+                num_reader_tasks: usize,
+                work_per_critical_section: usize,
+                work_between_critical_sections: usize,
+                seconds_per_test: usize,
+                test_iterations: usize,
+                ex: ThreadPool,
+            ) {
+                let mut writers = vec![];
+                let mut readers = vec![];
 
-    drop((wtx, rtx));
-    block_on(join(wrx.map(|x| x.0).collect(), rrx.map(|x| x.0).collect()))
+                for _ in 0..test_iterations {
+                    let (run_writers, run_readers) = run_benchmark(
+                        num_writer_tasks,
+                        num_reader_tasks,
+                        work_per_critical_section,
+                        work_between_critical_sections,
+                        seconds_per_test,
+                        ex.clone(),
+                    );
+                    writers.extend_from_slice(&run_writers);
+                    readers.extend_from_slice(&run_readers);
+                }
+
+                let total_writers =
+                    writers.iter().fold(0f64, |a, b| a + *b as f64) / test_iterations as f64;
+                let total_readers =
+                    readers.iter().fold(0f64, |a, b| a + *b as f64) / test_iterations as f64;
+                println!(
+                    "{:20} - [write] {:10.3} kHz [read] {:10.3} kHz",
+                    $name,
+                    total_writers as f64 / seconds_per_test as f64 / 1000.0,
+                    total_readers as f64 / seconds_per_test as f64 / 1000.0
+                );
+            }
+        }
+    };
 }
 
-fn run_posh_benchmark_iterations(
-    num_writer_tasks: usize,
-    num_reader_tasks: usize,
-    work_per_critical_section: usize,
-    work_between_critical_sections: usize,
-    seconds_per_test: usize,
-    test_iterations: usize,
-    ex: ThreadPool,
-) {
-    let mut writers = vec![];
-    let mut readers = vec![];
-
-    for _ in 0..test_iterations {
-        let (run_writers, run_readers) = run_posh_benchmark(
-            num_writer_tasks,
-            num_reader_tasks,
-            work_per_critical_section,
-            work_between_critical_sections,
-            seconds_per_test,
-            ex.clone(),
-        );
-        writers.extend_from_slice(&run_writers);
-        readers.extend_from_slice(&run_readers);
-    }
-
-    let total_writers = writers.iter().fold(0f64, |a, b| a + *b as f64) / test_iterations as f64;
-    let total_readers = readers.iter().fold(0f64, |a, b| a + *b as f64) / test_iterations as f64;
-    println!(
-        "{:20} - [write] {:10.3} kHz [read] {:10.3} kHz",
-        "posh::Mutex",
-        total_writers as f64 / seconds_per_test as f64 / 1000.0,
-        total_readers as f64 / seconds_per_test as f64 / 1000.0
-    );
-}
+async_rwlock!(posh_bench, posh::Mutex<f64>, "posh::Mutex");
+async_rwlock!(tokio_bench, tokio::sync::RwLock<f64>, "tokio::RwLock");
+async_rwlock!(async_std_bench, async_std::sync::RwLock<f64>, "async_std::RwLock");
 
 fn run_benchmark<M: RwLock<f64> + Send + Sync + 'static>(
     num_writer_tasks: usize,
@@ -325,15 +393,19 @@ fn run_benchmark<M: RwLock<f64> + Send + Sync + 'static>(
 ) -> (Vec<usize>, Vec<usize>) {
     let lock = Arc::new(([0u8; 300], M::new(0.0), [0u8; 300]));
     let keep_going = Arc::new(AtomicBool::new(true));
+    let barrier = Arc::new(Barrier::new(num_reader_tasks + num_writer_tasks));
     let (wtx, wrx) = channel(num_writer_tasks);
     for _ in 0..num_writer_tasks {
         let lock = lock.clone();
         let keep_going = keep_going.clone();
+        let barrier = barrier.clone();
         let mut tx = wtx.clone();
         ex.spawn_ok(async move {
             let mut local_value = 0.0;
             let mut value = 0.0;
             let mut iterations = 0usize;
+
+            barrier.wait().await;
             while keep_going.load(Ordering::Relaxed) {
                 lock.1.write(|shared_value| {
                     for _ in 0..work_per_critical_section {
@@ -356,11 +428,14 @@ fn run_benchmark<M: RwLock<f64> + Send + Sync + 'static>(
     for _ in 0..num_reader_tasks {
         let lock = lock.clone();
         let keep_going = keep_going.clone();
+        let barrier = barrier.clone();
         let mut tx = rtx.clone();
         ex.spawn_ok(async move {
             let mut local_value = 0.0;
             let mut value = 0.0;
             let mut iterations = 0usize;
+
+            barrier.wait().await;
             while keep_going.load(Ordering::Relaxed) {
                 lock.1.read(|shared_value| {
                     for _ in 0..work_per_critical_section {
@@ -452,8 +527,11 @@ fn run_all(
     }
     *first = false;
 
-    let ex = ThreadPool::new().unwrap();
-    run_benchmark_iterations::<parking_lot::RwLock<f64>>(
+    let ex = ThreadPool::builder()
+        .pool_size(num_writer_tasks + num_reader_tasks)
+        .create()
+        .unwrap();
+    tokio_bench::run_benchmark_iterations(
         num_writer_tasks,
         num_reader_tasks,
         work_per_critical_section,
@@ -462,7 +540,25 @@ fn run_all(
         test_iterations,
         ex.clone(),
     );
-    run_posh_benchmark_iterations(
+    posh_bench::run_benchmark_iterations(
+        num_writer_tasks,
+        num_reader_tasks,
+        work_per_critical_section,
+        work_between_critical_sections,
+        seconds_per_test,
+        test_iterations,
+        ex.clone(),
+    );
+    async_std_bench::run_benchmark_iterations(
+        num_writer_tasks,
+        num_reader_tasks,
+        work_per_critical_section,
+        work_between_critical_sections,
+        seconds_per_test,
+        test_iterations,
+        ex.clone(),
+    );
+    run_benchmark_iterations::<parking_lot::RwLock<f64>>(
         num_writer_tasks,
         num_reader_tasks,
         work_per_critical_section,

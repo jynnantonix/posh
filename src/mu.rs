@@ -779,6 +779,12 @@ impl<T: ?Sized> Mutex<T> {
         }
     }
 
+    /// Alias for `Mutex::lock()`.
+    #[inline]
+    pub async fn write(&self) -> MutexGuard<'_, T> {
+        self.lock().await
+    }
+
     /// Acquires shared, immutable access to the resource protected by the `Mutex`, blocking the
     /// current task until it is able to do so. Upon returning there may be other tasks that
     /// also have immutable access to the resource but there will not be any tasks that have
@@ -799,6 +805,12 @@ impl<T: ?Sized> Mutex<T> {
             mu: self,
             marker: PhantomData,
         }
+    }
+
+    /// Alias for `Mutex::read_lock()`.
+    #[inline]
+    pub async fn read(&self) -> MutexReadGuard<'_, T> {
+        self.read_lock().await
     }
 
     // Called from `Condvar::wait` when the task wants to reacquire the lock.

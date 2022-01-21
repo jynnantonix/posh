@@ -171,99 +171,128 @@ impl<T> Drop for PthreadMutex<T> {
     }
 }
 
-#[inline]
-async fn with_posh_lock<F, T, R>(mu: &posh::Mutex<T>, f: F) -> R
-where
-    F: FnOnce(&mut T) -> R,
-{
-    f(&mut *mu.lock().await)
-}
+// We have to use a macro instead of generic because we can't have async traits without GATs.
+macro_rules! async_mutex {
+    ($mod:ident, $ty:ty, $name:literal) => {
+        mod $mod {
+            use std::{
+                sync::{
+                    atomic::{AtomicBool, Ordering},
+                    Arc,
+                },
+                thread,
+                time::Duration,
+            };
 
-fn run_posh_benchmark(
-    num_tasks: usize,
-    work_per_critical_section: usize,
-    work_between_critical_sections: usize,
-    seconds_per_test: usize,
-    ex: ThreadPool,
-) -> Vec<usize> {
-    let lock = Arc::new(([0u8; 300], posh::Mutex::new(0.0), [0u8; 300]));
-    let barrier = Arc::new(Barrier::new(num_tasks));
-    let keep_going = Arc::new(AtomicBool::new(true));
-    let (tx, rx) = channel(num_tasks);
-    for _ in 0..num_tasks {
-        let lock = lock.clone();
-        let barrier = barrier.clone();
-        let keep_going = keep_going.clone();
-        let mut tx = tx.clone();
-        ex.spawn_ok(async move {
-            let mut local_value = 0.0;
-            let mut value = 0.0;
-            let mut iterations = 0usize;
-            barrier.wait().await;
-            while keep_going.load(Ordering::Relaxed) {
-                with_posh_lock(&lock.1, |shared_value| {
-                    for _ in 0..work_per_critical_section {
-                        *shared_value += value;
-                        *shared_value *= 1.01;
-                        value = *shared_value;
-                    }
-                }).await;
-                for _ in 0..work_between_critical_sections {
-                    local_value += value;
-                    local_value *= 1.01;
-                    value = local_value;
-                }
-                iterations += 1;
+            use futures::{
+                channel::mpsc::channel,
+                executor::{block_on, ThreadPool},
+                SinkExt, StreamExt,
+            };
+
+            use super::Barrier;
+
+            #[inline]
+            async fn with_lock<F, R>(mu: &$ty, f: F) -> R
+            where
+                F: FnOnce(&mut f64) -> R,
+            {
+                f(&mut *mu.lock().await)
             }
-            tx.send((iterations, value)).await.unwrap();
-        });
-    }
 
-    thread::sleep(Duration::from_secs(seconds_per_test as u64));
-    keep_going.store(false, Ordering::Relaxed);
+            fn run_benchmark(
+                num_tasks: usize,
+                work_per_critical_section: usize,
+                work_between_critical_sections: usize,
+                seconds_per_test: usize,
+                ex: ThreadPool,
+            ) -> Vec<usize> {
+                let lock = Arc::new(([0u8; 300], <$ty>::new(0.0), [0u8; 300]));
+                let barrier = Arc::new(Barrier::new(num_tasks));
+                let keep_going = Arc::new(AtomicBool::new(true));
+                let (tx, rx) = channel(num_tasks);
+                for _ in 0..num_tasks {
+                    let lock = lock.clone();
+                    let barrier = barrier.clone();
+                    let keep_going = keep_going.clone();
+                    let mut tx = tx.clone();
+                    ex.spawn_ok(async move {
+                        let mut local_value = 0.0;
+                        let mut value = 0.0;
+                        let mut iterations = 0usize;
+                        barrier.wait().await;
+                        while keep_going.load(Ordering::Relaxed) {
+                            with_lock(&lock.1, |shared_value| {
+                                for _ in 0..work_per_critical_section {
+                                    *shared_value += value;
+                                    *shared_value *= 1.01;
+                                    value = *shared_value;
+                                }
+                            })
+                            .await;
+                            for _ in 0..work_between_critical_sections {
+                                local_value += value;
+                                local_value *= 1.01;
+                                value = local_value;
+                            }
+                            iterations += 1;
+                        }
+                        tx.send((iterations, value)).await.unwrap();
+                    });
+                }
 
-    drop(tx);
-    block_on(rx.map(|x| x.0).collect())
+                thread::sleep(Duration::from_secs(seconds_per_test as u64));
+                keep_going.store(false, Ordering::Relaxed);
+
+                drop(tx);
+                block_on(rx.map(|x| x.0).collect())
+            }
+
+            pub fn run_benchmark_iterations(
+                num_tasks: usize,
+                work_per_critical_section: usize,
+                work_between_critical_sections: usize,
+                seconds_per_test: usize,
+                test_iterations: usize,
+                ex: ThreadPool,
+            ) {
+                let mut data = vec![];
+                for _ in 0..test_iterations {
+                    let run_data = run_benchmark(
+                        num_tasks,
+                        work_per_critical_section,
+                        work_between_critical_sections,
+                        seconds_per_test,
+                        ex.clone(),
+                    );
+                    data.extend_from_slice(&run_data);
+                }
+
+                let total = data.iter().fold(0f64, |a, b| a + *b as f64);
+                let average = total / data.len() as f64;
+                let variance = data
+                    .iter()
+                    .fold(0f64, |a, b| a + ((*b as f64 - average).powi(2)))
+                    / data.len() as f64;
+                data.sort();
+
+                let k_hz = 1.0 / seconds_per_test as f64 / 1000.0;
+                println!(
+                    "{:20} | {:10.3} kHz | {:10.3} kHz | {:10.3} kHz | {:10.3} kHz",
+                    $name,
+                    total * k_hz,
+                    average * k_hz,
+                    data[data.len() / 2] as f64 * k_hz,
+                    variance.sqrt() * k_hz
+                );
+            }
+        }
+    };
 }
 
-fn run_posh_benchmark_iterations(
-    num_tasks: usize,
-    work_per_critical_section: usize,
-    work_between_critical_sections: usize,
-    seconds_per_test: usize,
-    test_iterations: usize,
-    ex: ThreadPool,
-) {
-    let mut data = vec![];
-    for _ in 0..test_iterations {
-        let run_data = run_posh_benchmark(
-            num_tasks,
-            work_per_critical_section,
-            work_between_critical_sections,
-            seconds_per_test,
-            ex.clone(),
-        );
-        data.extend_from_slice(&run_data);
-    }
-
-    let total = data.iter().fold(0f64, |a, b| a + *b as f64);
-    let average = total / data.len() as f64;
-    let variance = data
-        .iter()
-        .fold(0f64, |a, b| a + ((*b as f64 - average).powi(2)))
-        / data.len() as f64;
-    data.sort();
-
-    let k_hz = 1.0 / seconds_per_test as f64 / 1000.0;
-    println!(
-        "{:20} | {:10.3} kHz | {:10.3} kHz | {:10.3} kHz | {:10.3} kHz",
-        "posh::Mutex",
-        total * k_hz,
-        average * k_hz,
-        data[data.len() / 2] as f64 * k_hz,
-        variance.sqrt() * k_hz
-    );
-}
+async_mutex!(posh_bench, posh::Mutex<f64>, "posh::Mutex");
+async_mutex!(tokio_bench, tokio::sync::Mutex<f64>, "tokio::Mutex");
+async_mutex!(async_std_bench, async_std::sync::Mutex<f64>, "async_std::Mutex");
 
 fn run_benchmark<M: Mutex<f64> + Send + Sync + 'static>(
     num_tasks: usize,
@@ -384,7 +413,7 @@ fn run_all(
 
     let ex = ThreadPool::builder().pool_size(num_tasks).create().unwrap();
 
-    run_benchmark_iterations::<parking_lot::Mutex<f64>>(
+    tokio_bench::run_benchmark_iterations(
         num_tasks,
         work_per_critical_section,
         work_between_critical_sections,
@@ -393,7 +422,25 @@ fn run_all(
         ex.clone(),
     );
 
-    run_posh_benchmark_iterations(
+    posh_bench::run_benchmark_iterations(
+        num_tasks,
+        work_per_critical_section,
+        work_between_critical_sections,
+        seconds_per_test,
+        test_iterations,
+        ex.clone(),
+    );
+
+    async_std_bench::run_benchmark_iterations(
+        num_tasks,
+        work_per_critical_section,
+        work_between_critical_sections,
+        seconds_per_test,
+        test_iterations,
+        ex.clone(),
+    );
+
+    run_benchmark_iterations::<parking_lot::Mutex<f64>>(
         num_tasks,
         work_per_critical_section,
         work_between_critical_sections,

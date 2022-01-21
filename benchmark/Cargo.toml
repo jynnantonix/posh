@@ -10,6 +10,8 @@ seqlock = "0.1"
 libc = "0.2"
 posh = { path = ".." }
 futures = { version = "0.3.19", default-features = false, features = ["alloc", "executor", "thread-pool"] }
+tokio = { version = "1.15.0", features = ["sync"] }
+async-std = "1.10.0"
 
 [[bin]]
 name = "mutex"
