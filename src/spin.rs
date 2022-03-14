@@ -119,9 +119,10 @@ impl<T> From<T> for SpinLock<T> {
     }
 }
 
-/// An RAII implementation of a "scoped lock" for a `SpinLock`. When this structure is dropped, the
-/// lock will be released. The resource protected by the `SpinLock` can be accessed via the `Deref`
-/// and `DerefMut` implementations of this structure.
+/// An RAII implementation of a "scoped lock" for a [`SpinLock`].
+///
+/// When this structure is dropped, the lock will be released. The resource protected by the
+/// `SpinLock` can be accessed via the `Deref` and `DerefMut` implementations of this structure.
 pub struct SpinLockGuard<'a, T: 'a + ?Sized> {
     lock: &'a SpinLock<T>,
     value: &'a mut T,

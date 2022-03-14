@@ -711,29 +711,30 @@ fn cancel_waiter(mu: *const (), waiter: &Waiter, wake_next: bool) {
 
 /// A high-level primitive that provides safe, mutable access to a shared resource.
 ///
-/// Unlike more traditional mutexes, `Mutex` can safely provide both shared, immutable access (via
-/// `read_lock()`) as well as exclusive, mutable access (via `lock()`) to an underlying resource
-/// with no loss of performance.
+/// Unlike more traditional mutexes, [`Mutex`] can safely provide both shared, immutable access (via
+/// [`Mutex::read_lock()`]) as well as exclusive, mutable access (via [`Mutex::lock()`]) to an
+/// underlying resource with no loss of performance.
 ///
 /// # Poisoning
 ///
-/// `Mutex` does not support lock poisoning so if a task panics while holding the lock, the
+/// [`Mutex`] does not support lock poisoning so if a task panics while holding the lock, the
 /// poisoned data will be accessible by other tasks in your program. If you need to guarantee that
-/// other tasks cannot access poisoned data then you may wish to wrap this `Mutex` inside another
-/// type that provides the poisoning feature. See the implementation of `std::Mutex` for an
+/// other tasks cannot access poisoned data then you may wish to wrap this [`Mutex`] inside another
+/// type that provides the poisoning feature. See the implementation of [`std::sync::Mutex`] for an
 /// example of this.
 ///
 ///
 /// # Fairness
 ///
-/// This `Mutex` implementation does not guarantee that tasks will acquire the lock in the same
+/// This [`Mutex`] implementation does not guarantee that tasks will acquire the lock in the same
 /// order that they call `lock()` or `read_lock()`. However it will attempt to prevent long-term
 /// starvation: if a task repeatedly fails to acquire the lock beyond a threshold then all other
 /// tasks will fail to acquire the lock until the starved task has acquired it.
 ///
-/// Similarly, this `Mutex` will attempt to balance reader and writer tasks: once there is a
+/// Similarly, this [`Mutex`] will attempt to balance reader and writer tasks: once there is a
 /// writer task waiting to acquire the lock no new reader tasks will be allowed to acquire it.
-/// However, any reader tasks that were already waiting will still be allowed to acquire it.
+/// However, any reader tasks that were already waiting will not be prevented from acquiring a
+/// shared lock.
 ///
 /// # Examples
 ///
@@ -777,7 +778,7 @@ pub struct Mutex<T: ?Sized> {
 }
 
 impl<T> Mutex<T> {
-    /// Create a new, unlocked `Mutex` ready for use.
+    /// Create a new, unlocked [`Mutex`] ready for use.
     pub fn new(v: T) -> Mutex<T> {
         Mutex {
             raw: RawMutex::new(),
@@ -785,9 +786,9 @@ impl<T> Mutex<T> {
         }
     }
 
-    /// Consume the `Mutex` and return the contained value. This method does not perform any locking
+    /// Consume the [`Mutex`] and return the contained value. This method does not perform any locking
     /// as the compiler will guarantee that there are no other references to `self` and the caller
-    /// owns the `Mutex`.
+    /// owns the [`Mutex`].
     pub fn into_inner(self) -> T {
         // Don't need to acquire the lock because the compiler guarantees that there are
         // no references to `self`.
@@ -796,15 +797,15 @@ impl<T> Mutex<T> {
 }
 
 impl<T: ?Sized> Mutex<T> {
-    /// Acquires exclusive, mutable access to the resource protected by the `Mutex`, blocking the
+    /// Acquires exclusive, mutable access to the resource protected by the [`Mutex`], blocking the
     /// current task until it is able to do so. Upon returning, the current task will be the
-    /// only task with access to the resource. The `Mutex` will be released when the returned
+    /// only task with access to the resource. The [`Mutex`] will be released when the returned
     /// `MutexGuard` is dropped.
     ///
     /// Calling `lock()` while holding a `MutexGuard` or a `MutexReadGuard` will cause a deadlock.
     ///
     /// Callers that are not in an async context may wish to use the `block_on` method to block the
-    /// task until the `Mutex` is acquired.
+    /// task until the [`Mutex`] is acquired.
     #[inline]
     pub async fn lock(&self) -> MutexGuard<'_, T> {
         self.raw.lock().await;
@@ -822,7 +823,7 @@ impl<T: ?Sized> Mutex<T> {
         self.lock().await
     }
 
-    /// Acquires shared, immutable access to the resource protected by the `Mutex`, blocking the
+    /// Acquires shared, immutable access to the resource protected by the [`Mutex`], blocking the
     /// current task until it is able to do so. Upon returning there may be other tasks that
     /// also have immutable access to the resource but there will not be any tasks that have
     /// mutable access to the resource. When the returned `MutexReadGuard` is dropped the task
@@ -832,7 +833,7 @@ impl<T: ?Sized> Mutex<T> {
     /// while holding a `MutexGuard` will deadlock.
     ///
     /// Callers that are not in an async context may wish to use the `block_on` method to block the
-    /// task until the `Mutex` is acquired.
+    /// task until the [`Mutex`] is acquired.
     #[inline]
     pub async fn read_lock(&self) -> MutexReadGuard<'_, T> {
         self.raw.read_lock().await;
@@ -888,6 +889,10 @@ impl<T: ?Sized> Mutex<T> {
         self.raw.read_unlock();
     }
 
+    /// Returns a mutable reference to the underlying data.
+    ///
+    /// Since this call borrows the [`Mutex`] mutably, no locking is necessary as the compiler will
+    /// statically guarantee that no other locks exist.
     pub fn get_mut(&mut self) -> &mut T {
         // Safe because the compiler statically guarantees that are no other references to `self`.
         // This is also why we don't need to acquire the lock first.
@@ -910,9 +915,10 @@ impl<T> From<T> for Mutex<T> {
     }
 }
 
-/// An RAII implementation of a "scoped exclusive lock" for a `Mutex`. When this structure is
-/// dropped, the lock will be released. The resource protected by the `Mutex` can be accessed via
-/// the `Deref` and `DerefMut` implementations of this structure.
+/// An RAII implementation of a "scoped exclusive lock" for a [`Mutex`].
+///
+/// When this structure is dropped, the lock will be released. The resource protected by the [`Mutex`]
+/// can be accessed via the `Deref` and `DerefMut` implementations of this structure.
 pub struct MutexGuard<'a, T: ?Sized + 'a> {
     mu: &'a Mutex<T>,
     marker: PhantomData<&'a mut T>,
@@ -969,9 +975,10 @@ impl<'a, T: ?Sized> Drop for MutexGuard<'a, T> {
     }
 }
 
-/// An RAII implementation of a "scoped shared lock" for a `Mutex`. When this structure is dropped,
-/// the lock will be released. The resource protected by the `Mutex` can be accessed via the `Deref`
-/// implementation of this structure.
+/// An RAII implementation of a "scoped shared lock" for a [`Mutex`].
+///
+/// When this structure is dropped, the lock will be released. The resource protected by the [`Mutex`]
+/// can be accessed via the `Deref` implementation of this structure.
 pub struct MutexReadGuard<'a, T: ?Sized + 'a> {
     mu: &'a Mutex<T>,
     marker: PhantomData<&'a T>,

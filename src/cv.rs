@@ -114,26 +114,26 @@ impl Condvar {
     /// ```
     /// # use std::sync::Arc;
     /// # use std::thread;
-    ///
+    /// #
     /// # use posh::{
     /// #     block_on,
     /// #     Condvar, Mutex,
     /// # };
-    ///
+    /// #
     /// # let mu = Arc::new(Mutex::new(false));
     /// # let cv = Arc::new(Condvar::new());
     /// # let (mu2, cv2) = (mu.clone(), cv.clone());
-    ///
+    /// #
     /// # let t = thread::spawn(move || {
     /// #     *block_on(mu2.lock()) = true;
     /// #     cv2.notify_all();
     /// # });
-    ///
+    /// #
     /// let mut ready = block_on(mu.lock());
     /// while !*ready {
     ///     ready = block_on(cv.wait(ready));
     /// }
-    ///
+    /// #
     /// # t.join().expect("failed to join task");
     /// ```
     // Clippy doesn't like the lifetime parameters here but doing what it suggests leads to code
